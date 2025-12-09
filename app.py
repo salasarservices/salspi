@@ -7,8 +7,14 @@ st.set_page_config(page_title="Website Crawler & Search", layout="wide")
 
 try:
     import os
+    import threading
+    import queue
+    import time
+    import re
     import pandas as pd
     from io import StringIO
+
+    # App modules (assumed present in repo)
     from crawler import Crawler
     from search_index import SearchIndex
     from db import (
@@ -18,14 +24,9 @@ try:
         get_mongo_client,
     )
 
-    import threading
-    import queue
-    import time
-    import re
-
     # --- Constants / Defaults ---
-    MAX_PAGES = 5000  # hard limit per your request
-    BATCH_SAVE_SIZE = 50  # internal batch save size (no UI exposed)
+    MAX_PAGES = 5000  # hard cap
+    BATCH_SAVE_SIZE = 50
     DEFAULT_SEARCH_FIELDS = ["title", "meta", "text", "alt", "headings", "ocr"]
 
     # --- Secrets and credentials detection ---
@@ -37,7 +38,7 @@ try:
     google_secrets = st.secrets.get("google", {}) if hasattr(st, "secrets") else {}
     google_creds_json = google_secrets.get("credentials")  # optional JSON string
 
-    # If Google creds are present in secrets and not already in env, write to temp file
+    # If Google creds exist in secrets and not already in env, write to temp file
     if google_creds_json and not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
         try:
             creds_path = "/tmp/streamlit_google_creds.json"
@@ -47,55 +48,57 @@ try:
         except Exception:
             pass
 
-    # Detect whether Google credentials are present (explicit file)
     google_creds_present = bool(os.getenv("GOOGLE_APPLICATION_CREDENTIALS"))
 
-    # --- UI ---
+    # --- Ensure session_state keys ---
+    if "pages" not in st.session_state:
+        st.session_state.pages = []
+    if "index" not in st.session_state:
+        st.session_state.index = None
+    if "crawl_thread" not in st.session_state:
+        st.session_state.crawl_thread = None
+    if "crawl_queue" not in st.session_state:
+        st.session_state.crawl_queue = None
+    if "crawl_running" not in st.session_state:
+        st.session_state.crawl_running = False
+    if "crawl_start_ts" not in st.session_state:
+        st.session_state.crawl_start_ts = None
+    if "crawl_stats" not in st.session_state:
+        st.session_state.crawl_stats = {"inserted": 0, "updated": 0, "ocr_inserted": 0, "ocr_updated": 0, "errors": []}
+
+    # --- UI Header ---
     st.title("Website Crawler & Search")
     st.markdown(
         "Crawl a site (up to 5000 pages) and search titles, descriptions, body text, image alt tags, OCR text and headings. "
         "Single-query search only (search runs across all indexed fields)."
     )
 
-    # Sidebar controls (crawl settings & sentiment)
+    # --- Sidebar: Crawl settings & Sentiment & Mongo actions ---
     st.sidebar.header("Crawl settings")
-    start_url = st.sidebar.text_input(
-        "Start URL (including http:// or https://)", value="https://example.com"
-    )
-    delay = st.sidebar.slider(
-        "Delay between requests (seconds)", min_value=0.0, max_value=5.0, value=0.5, step=0.1
-    )
+    start_url = st.sidebar.text_input("Start URL (including http:// or https://)", value="https://example.com")
+    delay = st.sidebar.slider("Delay between requests (seconds)", min_value=0.0, max_value=5.0, value=0.5, step=0.1)
     same_domain = st.sidebar.checkbox("Restrict to same domain", True)
     st.sidebar.markdown("Advanced")
     user_agent = st.sidebar.text_input("User-Agent header", value="site-crawler-bot/1.0")
     timeout = st.sidebar.number_input("Request timeout (s)", min_value=1, value=10)
 
     st.sidebar.header("Sentiment")
-    sentiment_backend = st.sidebar.selectbox(
-        "Sentiment backend", options=["nltk", "google"], index=0
-    )
+    sentiment_backend = st.sidebar.selectbox("Sentiment backend", options=["nltk", "google"], index=0)
     if sentiment_backend == "google" and not google_creds_present:
-        st.sidebar.warning(
-            "Google credentials not found. Set GOOGLE_APPLICATION_CREDENTIALS or st.secrets['google']['credentials'] to use Google NLP."
-        )
-    st.sidebar.caption(
-        "Google requires GOOGLE_APPLICATION_CREDENTIALS to be set or credentials provided via secrets."
-    )
+        st.sidebar.warning("Google credentials not found. Set GOOGLE_APPLICATION_CREDENTIALS or st.secrets['google']['credentials'] to use Google NLP.")
+    st.sidebar.caption("Google requires GOOGLE_APPLICATION_CREDENTIALS or secrets.")
 
-    # --- MongoDB actions & app controls (left sidebar) ---
     st.sidebar.markdown("---")
     st.sidebar.header("MongoDB actions")
 
-    # Refresh MongoDB data (load pages from mongo and rebuild index)
+    # Refresh MongoDB data
     if st.sidebar.button("Refresh MongoDB data"):
         if not mongo_uri:
             st.sidebar.error("Mongo URI not found in secrets or environment (MONGO_URI).")
         else:
             with st.spinner("Refreshing pages from MongoDB and rebuilding index..."):
                 try:
-                    pages = load_pages_from_mongo(
-                        uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, limit=MAX_PAGES
-                    )
+                    pages = load_pages_from_mongo(uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, limit=MAX_PAGES)
                     st.session_state.pages = pages
                     idx = SearchIndex()
                     idx.build(pages)
@@ -104,11 +107,9 @@ try:
                 except Exception as e:
                     st.sidebar.error(f"Failed to refresh from MongoDB: {e}")
 
-    # Delete MongoDB data (two-step confirmation)
+    # Delete MongoDB data (two-step)
     st.sidebar.markdown("**Delete MongoDB data (pages + ocr-data)**")
-    confirm_delete_text = st.sidebar.text_input(
-        "Type DELETE to enable delete button", key="confirm_delete_text"
-    )
+    confirm_delete_text = st.sidebar.text_input("Type DELETE to enable delete button", key="confirm_delete_text")
     if confirm_delete_text == "DELETE":
         if st.sidebar.button("Confirm DELETE collections"):
             if not mongo_uri:
@@ -124,18 +125,16 @@ try:
                             dropped.append(coll_name)
                     client.close()
                     st.sidebar.success(f"Dropped collections: {', '.join(dropped) if dropped else 'none found'}")
-                    # clear in-memory index as well
                     st.session_state.pages = []
                     st.session_state.index = None
+                    st.session_state.crawl_stats = {"inserted": 0, "updated": 0, "ocr_inserted": 0, "ocr_updated": 0, "errors": []}
                 except Exception as e:
                     st.sidebar.error(f"Failed to delete collections: {e}")
     else:
         st.sidebar.info("Enter DELETE to enable the collection delete button.")
 
     st.sidebar.markdown("---")
-    # Refresh app & clear cache button
     if st.sidebar.button("Refresh app & clear cache"):
-        # clear Streamlit caches if available (try both APIs)
         try:
             if hasattr(st, "cache_data") and hasattr(st.cache_data, "clear"):
                 st.cache_data.clear()
@@ -146,75 +145,48 @@ try:
                 st.cache_resource.clear()
         except Exception:
             pass
-        # clear session state except secrets
-        for k in list(st.session_state.keys()):
+        # clear session state except secrets keys
+        keys = list(st.session_state.keys())
+        for k in keys:
             try:
                 del st.session_state[k]
             except Exception:
                 pass
-        # re-run to refresh UI
         st.experimental_rerun()
 
-    # --- Session state init (ensure keys exist) ---
-    if "pages" not in st.session_state:
-        st.session_state.pages = []
-    if "index" not in st.session_state:
-        st.session_state.index = None
-
-    # Main controls
+    # --- Main controls ---
     col1, col2 = st.columns([2, 1])
     with col1:
-        start_crawl = st.button("Start crawl")
-        stop_crawl = st.button("Stop (not implemented)")
+        start_btn = st.button("Start crawl", disabled=st.session_state.crawl_running)
+        stop_btn = st.button("Stop (not implemented)")
     with col2:
         st.write("Index status")
         if st.session_state.pages:
-            st.write(f"Pages indexed: {len(st.session_state.pages)} (showing in-memory index)")
+            st.write(f"Pages indexed: {len(st.session_state.pages)} (in-memory)")
         else:
             st.write("No pages indexed")
 
-    # Real-time progress area: progress bar, percent text, numeric metrics
+    # Real-time progress placeholders
     st.markdown("### Crawl progress (real time)")
-    progress_area_col1, progress_area_col2 = st.columns([3, 2])
+    pa_col1, pa_col2 = st.columns([3, 2])
+    with pa_col1:
+        progress_ph = st.empty()
+        progress_bar = progress_ph.progress(0)
+        percent_ph = st.empty()
+        percent_ph.markdown("Completion: 0%")
+    with pa_col2:
+        mc1, mc2 = st.columns(2)
+        pages_crawled_ph = mc1.empty()
+        pages_saved_ph = mc2.empty()
+        mc3, mc4 = st.columns(2)
+        ocr_saved_ph = mc3.empty()
+        errors_ph = mc4.empty()
 
-    with progress_area_col1:
-        progress_bar_ph = st.empty()
-        progress_bar = progress_bar_ph.progress(0)
-        percent_text_ph = st.empty()
-        percent_text_ph.markdown("Completion: 0%")
-
-    with progress_area_col2:
-        metrics_cols = st.columns(2)
-        pages_crawled_ph = metrics_cols[0].empty()
-        pages_saved_ph = metrics_cols[1].empty()
-        # Another row for OCR and errors
-        metrics_cols2 = st.columns(2)
-        ocr_saved_ph = metrics_cols2[0].empty()
-        errors_ph = metrics_cols2[1].empty()
-
-    # Additional status logs and ETA
     status_text = st.empty()
     log_area = st.empty()
     running_info = st.empty()
 
-    # Load from MongoDB and build index (utility) - kept as alternative
-    st.sidebar.markdown("---")
-    if st.sidebar.button("Load from MongoDB and build index"):
-        if not mongo_uri:
-            st.sidebar.error("Mongo URI not found in secrets or environment (MONGO_URI).")
-        else:
-            with st.spinner("Loading pages from MongoDB..."):
-                try:
-                    pages = load_pages_from_mongo(uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, limit=MAX_PAGES)
-                    st.session_state.pages = pages
-                    idx = SearchIndex()
-                    idx.build(pages)
-                    st.session_state.index = idx
-                    st.sidebar.success(f"Loaded {len(pages)} pages and rebuilt in-memory index.")
-                except Exception as e:
-                    st.sidebar.error(f"Failed to load from MongoDB: {e}")
-
-    # Helper for ETA calculation
+    # --- Helper functions ---
     def eta_text(start_ts, processed, total):
         if processed <= 0:
             return "ETA: calculating..."
@@ -229,208 +201,203 @@ try:
             secs = int(eta_secs % 60)
             return f"ETA: {mins}m {secs}s"
 
-    # Start crawl: validate Google credential case
-    if start_crawl:
-        if sentiment_backend == "google" and not google_creds_present:
-            st.error(
-                "Google NLP selected but GOOGLE_APPLICATION_CREDENTIALS is not set. "
-                "Please set credentials in the environment or st.secrets['google']['credentials']."
-            )
-        elif not start_url or not start_url.startswith("http"):
-            st.error("Please enter a valid http/https Start URL.")
-        else:
-            st.info(f"Starting crawl — runs in a background thread; indexing up to {MAX_PAGES} pages and saving OCR to Mongo if configured.")
+    # Worker starter: create queue and thread in session_state
+    def start_crawl_background():
+        q = queue.Queue()
+        st.session_state.crawl_queue = q
+        st.session_state.crawl_start_ts = time.time()
+        st.session_state.crawl_stats = {"inserted": 0, "updated": 0, "ocr_inserted": 0, "ocr_updated": 0, "errors": []}
 
-            # Setup queue and thread
-            q = queue.Queue()
-            crawler = Crawler(
-                start_url=start_url,
-                max_pages=MAX_PAGES,
-                delay=float(delay),
-                same_domain=bool(same_domain),
-                headers={"User-Agent": user_agent},
-                timeout=int(timeout),
-                sentiment_backend=sentiment_backend,
-                ocr_enabled=True,
-            )
+        # instantiate crawler with chosen sentiment backend and OCR enabled
+        crawler = Crawler(
+            start_url=start_url,
+            max_pages=MAX_PAGES,
+            delay=float(delay),
+            same_domain=bool(same_domain),
+            headers={"User-Agent": user_agent},
+            timeout=int(timeout),
+            sentiment_backend=sentiment_backend,
+            ocr_enabled=True,
+        )
 
-            def on_page_threadsafe(page):
-                # background thread places page events on the queue
-                q.put({"type": "page", "page": page})
+        def on_page_callback(page):
+            # background thread must only put into queue
+            try:
+                st.session_state.crawl_queue.put({"type": "page", "page": page})
+            except Exception:
+                # fallback: ignore if queue not present
+                pass
 
-            def crawl_worker():
+        def worker():
+            try:
+                crawler.crawl(progress_callback=None, on_page=on_page_callback)
                 try:
-                    crawler.crawl(progress_callback=None, on_page=on_page_threadsafe)
-                    q.put({"type": "done"})
-                except Exception as e:
-                    q.put({"type": "error", "error": str(e)})
-                    q.put({"type": "done"})
+                    st.session_state.crawl_queue.put({"type": "done"})
+                except Exception:
+                    pass
+            except Exception as e:
+                try:
+                    st.session_state.crawl_queue.put({"type": "error", "error": str(e)})
+                    st.session_state.crawl_queue.put({"type": "done"})
+                except Exception:
+                    pass
 
-            t = threading.Thread(target=crawl_worker, daemon=True)
-            # reset pages in session_state, start time for ETA
-            st.session_state.pages = []
-            start_ts = time.time()
-            t.start()
+        t = threading.Thread(target=worker, daemon=True)
+        st.session_state.crawl_thread = t
+        st.session_state.crawl_running = True
+        t.start()
 
-            # incremental counters and buffers (main thread only)
-            inserted_total = 0
-            updated_total = 0
-            ocr_inserted = 0
-            ocr_updated = 0
-            save_errors = []
-            save_buffer = []
+    # Start button handling
+    if start_btn:
+        if not st.session_state.crawl_running:
+            if not start_url or not start_url.startswith("http"):
+                st.error("Please enter a valid http/https Start URL.")
+            else:
+                start_crawl_background()
+                st.info(f"Starting crawl — runs in background; indexing up to {MAX_PAGES} pages.")
+                # immediately rerun to let the queue-drain loop run in the fresh session
+                st.experimental_rerun()
 
-            # Poll loop: drain queue, update UI & persist batches (main thread)
-            while t.is_alive() or not q.empty():
-                drained = False
-                while not q.empty():
-                    drained = True
-                    item = q.get_nowait()
-                    if item["type"] == "page":
-                        page = item["page"]
-                        st.session_state.pages.append(page)
-                        current = len(st.session_state.pages)
+    # --- Queue draining & UI update loop (main thread only) ---
+    q = st.session_state.get("crawl_queue")
+    t = st.session_state.get("crawl_thread")
+    running = st.session_state.get("crawl_running", False)
+    stats = st.session_state.get("crawl_stats", {"inserted": 0, "updated": 0, "ocr_inserted": 0, "ocr_updated": 0, "errors": []})
+    save_buffer = []
 
-                        # update progress percentage and bar (animated updates)
-                        percent = int((current / float(MAX_PAGES)) * 100)
-                        percent = max(0, min(100, percent))
-                        progress_bar.progress(percent)
-                        percent_text_ph.markdown(f"Completion: {percent}%")
+    if q is not None:
+        # Drain all available queue items
+        drained_any = False
+        while not q.empty():
+            drained_any = True
+            try:
+                item = q.get_nowait()
+            except Exception:
+                break
+            if item.get("type") == "page":
+                page = item.get("page")
+                st.session_state.pages.append(page)
+                current = len(st.session_state.pages)
 
-                        # update metrics
-                        pages_crawled_ph.metric("Pages crawled", f"{current}")
-                        pages_saved_ph.metric("Pages saved", f"{inserted_total + updated_total}")
-                        ocr_saved_ph.metric("OCR docs saved", f"{ocr_inserted + ocr_updated}")
-                        errors_ph.metric("Batch errors", f"{len(save_errors)}")
+                # UI updates (main thread)
+                percent = int((current / float(MAX_PAGES)) * 100)
+                percent = max(0, min(100, percent))
+                progress_bar.progress(percent)
+                percent_ph.markdown(f"Completion: {percent}%")
 
-                        # status/log
-                        status_text.markdown(f"Crawled {current}/{MAX_PAGES}: {page.get('url')}")
-                        log_area.text(f"Last: {page.get('url')}  |  Title: {page.get('title','')}")
-                        running_info.text(eta_text(start_ts, current, MAX_PAGES))
+                pages_crawled_ph.metric("Pages crawled", f"{current}")
+                pages_saved_ph.metric("Pages saved", f"{stats.get('inserted',0) + stats.get('updated',0)}")
+                ocr_saved_ph.metric("OCR docs saved", f"{stats.get('ocr_inserted',0) + stats.get('ocr_updated',0)}")
+                errors_ph.metric("Batch errors", f"{len(stats.get('errors', []))}")
 
-                        # Add to buffer and persist in batches
-                        save_buffer.append(page)
-                        if len(save_buffer) >= BATCH_SAVE_SIZE:
-                            if mongo_uri:
-                                try:
-                                    summary = save_pages_to_mongo(
-                                        save_buffer,
-                                        uri=mongo_uri,
-                                        db_name=mongo_db,
-                                        collection_name=mongo_collection,
-                                        upsert=True,
-                                    )
-                                    inserted_total += summary.get("inserted", 0)
-                                    updated_total += summary.get("updated", 0)
-                                    if summary.get("errors"):
-                                        save_errors.extend(summary.get("errors"))
-                                except Exception as e:
-                                    save_errors.append({"error": str(e)})
-                                # save OCR data for this batch
-                                try:
-                                    ocr_summary = save_ocr_to_mongo(
-                                        save_buffer,
-                                        uri=mongo_uri,
-                                        db_name=mongo_db,
-                                        collection_name="ocr-data",
-                                        upsert=True,
-                                    )
-                                    ocr_inserted += ocr_summary.get("inserted", 0)
-                                    ocr_updated += ocr_summary.get("updated", 0)
-                                    if ocr_summary.get("errors"):
-                                        save_errors.extend(ocr_summary.get("errors"))
-                                except Exception as e:
-                                    save_errors.append({"ocr_error": str(e)})
-                            save_buffer.clear()
+                status_text.markdown(f"Crawled {current}/{MAX_PAGES}: {page.get('url')}")
+                log_area.text(f"Last: {page.get('url')}  |  Title: {page.get('title','')}")
+                running_info.text(eta_text(st.session_state.crawl_start_ts or time.time(), current, MAX_PAGES))
 
-                    elif item["type"] == "error":
-                        st.error(f"Crawl thread error: {item.get('error')}")
-                    elif item["type"] == "done":
-                        pass
+                # Save buffer & batch persist
+                save_buffer.append(page)
+                if len(save_buffer) >= BATCH_SAVE_SIZE:
+                    if mongo_uri:
+                        try:
+                            summary = save_pages_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, upsert=True)
+                            stats["inserted"] += summary.get("inserted", 0)
+                            stats["updated"] += summary.get("updated", 0)
+                            if summary.get("errors"):
+                                stats["errors"].extend(summary.get("errors"))
+                        except Exception as e:
+                            stats["errors"].append({"error": str(e)})
+                        # OCR docs save
+                        try:
+                            ocr_summary = save_ocr_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name="ocr-data", upsert=True)
+                            stats["ocr_inserted"] += ocr_summary.get("inserted", 0)
+                            stats["ocr_updated"] += ocr_summary.get("updated", 0)
+                            if ocr_summary.get("errors"):
+                                stats["errors"].extend(ocr_summary.get("errors"))
+                        except Exception as e:
+                            stats["errors"].append({"ocr_error": str(e)})
+                    save_buffer.clear()
+                # persist stats back to session
+                st.session_state.crawl_stats = stats
 
-                # small sleep so Streamlit can push updates to browser and animate the progress bar
-                time.sleep(0.12)
+            elif item.get("type") == "error":
+                st.error(f"Crawl thread error: {item.get('error')}")
+                stats["errors"].append({"thread_error": item.get("error")})
+                st.session_state.crawl_stats = stats
+            elif item.get("type") == "done":
+                # mark done; will handle finalization after loop
+                pass
 
-            # flush remaining buffer after crawl completes
+        # If the worker thread is still alive, request a short rerun so we continue draining queue and updating UI.
+        if st.session_state.crawl_thread is not None and st.session_state.crawl_thread.is_alive():
+            # brief sleep to avoid tight loop; then rerun so Streamlit pushes updates to browser
+            time.sleep(0.12)
+            st.experimental_rerun()
+        else:
+            # worker finished; flush remaining buffer and finalize
             if save_buffer:
                 if mongo_uri:
                     try:
-                        summary = save_pages_to_mongo(
-                            save_buffer,
-                            uri=mongo_uri,
-                            db_name=mongo_db,
-                            collection_name=mongo_collection,
-                            upsert=True,
-                        )
-                        inserted_total += summary.get("inserted", 0)
-                        updated_total += summary.get("updated", 0)
+                        summary = save_pages_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, upsert=True)
+                        stats["inserted"] += summary.get("inserted", 0)
+                        stats["updated"] += summary.get("updated", 0)
                         if summary.get("errors"):
-                            save_errors.extend(summary.get("errors"))
+                            stats["errors"].extend(summary.get("errors"))
                     except Exception as e:
-                        save_errors.append({"error": str(e)})
-                    # OCR save for remaining buffer
+                        stats["errors"].append({"error": str(e)})
                     try:
-                        ocr_summary = save_ocr_to_mongo(
-                            save_buffer,
-                            uri=mongo_uri,
-                            db_name=mongo_db,
-                            collection_name="ocr-data",
-                            upsert=True,
-                        )
-                        ocr_inserted += ocr_summary.get("inserted", 0)
-                        ocr_updated += ocr_summary.get("updated", 0)
+                        ocr_summary = save_ocr_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name="ocr-data", upsert=True)
+                        stats["ocr_inserted"] += ocr_summary.get("inserted", 0)
+                        stats["ocr_updated"] += ocr_summary.get("updated", 0)
                         if ocr_summary.get("errors"):
-                            save_errors.extend(ocr_summary.get("errors"))
+                            stats["errors"].extend(ocr_summary.get("errors"))
                     except Exception as e:
-                        save_errors.append({"ocr_error": str(e)})
+                        stats["errors"].append({"ocr_error": str(e)})
                 save_buffer.clear()
+                st.session_state.crawl_stats = stats
 
-            # Build index from collected pages
-            idx = SearchIndex()
-            idx.build(st.session_state.pages)
-            st.session_state.index = idx
+            # Build in-memory index if not already built or after a crawl
+            if st.session_state.pages:
+                idx = SearchIndex()
+                idx.build(st.session_state.pages)
+                st.session_state.index = idx
 
-            # final metric updates
+            # Final UI update
             total = len(st.session_state.pages)
-            final_percent = int((total / float(MAX_PAGES)) * 100)
-            final_percent = max(0, min(100, final_percent))
-            progress_bar.progress(final_percent)
-            percent_text_ph.markdown(f"Completion: {final_percent}%")
+            final_pct = int((total / float(MAX_PAGES)) * 100)
+            final_pct = max(0, min(100, final_pct))
+            progress_bar.progress(final_pct)
+            percent_ph.markdown(f"Completion: {final_pct}%")
             pages_crawled_ph.metric("Pages crawled", f"{total}")
-            pages_saved_ph.metric("Pages saved", f"{inserted_total + updated_total}")
-            ocr_saved_ph.metric("OCR docs saved", f"{ocr_inserted + ocr_updated}")
-            errors_ph.metric("Batch errors", f"{len(save_errors)}")
+            pages_saved_ph.metric("Pages saved", f"{stats.get('inserted',0) + stats.get('updated',0)}")
+            ocr_saved_ph.metric("OCR docs saved", f"{stats.get('ocr_inserted',0) + stats.get('ocr_updated',0)}")
+            errors_ph.metric("Batch errors", f"{len(stats.get('errors', []))}")
 
             running_info.empty()
-            st.success(f"Finished crawling: {len(st.session_state.pages)} pages collected (max {MAX_PAGES}).")
-            if mongo_uri:
-                st.write("Saved to Mongo in incremental batches during crawl (summary):")
-                st.write(f"Pages inserted: {inserted_total}, pages updated: {updated_total}")
-                st.write(f"OCR docs inserted: {ocr_inserted}, OCR docs updated: {ocr_updated}")
-                if save_errors:
-                    st.write(save_errors[:10])
-            else:
-                st.warning("Mongo URI not configured; pages (and OCR) indexed in-memory only. To persist set st.secrets['mongo']['uri'] or MONGO_URI.")
+            if st.session_state.crawl_running:
+                st.success(f"Finished crawling: {total} pages collected (max {MAX_PAGES}).")
+            # mark not running
+            st.session_state.crawl_running = False
+            st.session_state.crawl_thread = None
+            st.session_state.crawl_queue = None
+            st.session_state.crawl_start_ts = None
+            st.session_state.crawl_stats = stats
 
-    # --- Single-query search UI (kept) ---
+    # --- Single-query search UI ---
     st.markdown("---")
     st.subheader("Single query search")
     if not st.session_state.pages:
         st.info("No pages indexed yet. Start a crawl to index pages.")
-        search_q = st.text_input("Search query (word or phrase)", value="", disabled=True)
+        st.text_input("Search query (word or phrase)", value="", disabled=True)
     else:
         with st.form("search_form"):
             search_q = st.text_input("Search query (word or phrase)")
             submitted = st.form_submit_button("Search")
-        if submitted and search_q.strip():
-            idx = st.session_state.index
-            if not idx:
+        if submitted and search_q and search_q.strip():
+            if not st.session_state.index:
                 st.error("Index not built yet.")
             else:
                 with st.spinner("Searching..."):
-                    results = idx.search(
-                        search_q, fields=DEFAULT_SEARCH_FIELDS, phrase=(" " in search_q.strip()), max_results=500
-                    )
+                    results = st.session_state.index.search(search_q, fields=DEFAULT_SEARCH_FIELDS, phrase=(" " in search_q.strip()), max_results=500)
                 st.success(f"Found {len(results)} result rows")
                 if results:
                     df = pd.DataFrame(results)
@@ -476,7 +443,6 @@ try:
                             for tkn in set(tokens):
                                 display = re.sub(f"(?i)({re.escape(tkn)})", r"**\1**", display)
                             st.markdown(display[:5000] + ("..." if len(display) > 5000 else ""))
-                        st.markdown(f"[Open original page]({page.get('url')})")
 
 except Exception:
     tb = traceback.format_exc()
