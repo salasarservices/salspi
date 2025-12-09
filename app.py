@@ -13,12 +13,11 @@ try:
     from search_index import SearchIndex
     from db import save_pages_to_mongo, load_pages_from_mongo
 
-    # threading and queue for background crawl + UI polling
     import threading
     import queue
     import time
 
-    # --- Helper: get secrets ---
+    # --- Secrets and credentials detection ---
     mongo_secrets = st.secrets.get("mongo", {}) if hasattr(st, "secrets") else {}
     mongo_uri = mongo_secrets.get("uri") or os.getenv("MONGO_URI")
     mongo_db = mongo_secrets.get("db", "sitecrawler")
@@ -37,11 +36,14 @@ try:
         except Exception:
             pass
 
-    # --- UI layout and state initialization ---
-    st.title("Website Crawler & Search")
-    st.markdown("Crawl a site (limited pages) and search titles, descriptions, body text, image alt tags and headings. Sentiment backend selectable (NLTK or Google NLP).")
+    # Detect whether Google credentials are present (explicit file)
+    google_creds_present = bool(os.getenv("GOOGLE_APPLICATION_CREDENTIALS"))
 
-    # Sidebar: Crawl settings
+    # --- UI ---
+    st.title("Website Crawler & Search")
+    st.markdown("Crawl a site and search titles, descriptions, body text, image alt tags and headings. Select sentiment backend.")
+
+    # Sidebar controls
     st.sidebar.header("Crawl settings")
     start_url = st.sidebar.text_input("Start URL (including http:// or https://)", value="https://example.com")
     max_pages = st.sidebar.number_input("Max pages to crawl", min_value=1, max_value=2000, value=50, step=10)
@@ -51,27 +53,26 @@ try:
     user_agent = st.sidebar.text_input("User-Agent header", value="site-crawler-bot/1.0")
     timeout = st.sidebar.number_input("Request timeout (s)", min_value=1, value=10)
 
-    # Persistence / batch save
     st.sidebar.header("Persistence")
     batch_size = st.sidebar.number_input("Save to Mongo every N pages (batch size)", min_value=1, max_value=500, value=20, step=1)
     auto_save_mongo = st.sidebar.checkbox("Auto-save crawl to MongoDB after finishing", value=False)
 
-    # Sentiment backend
     st.sidebar.header("Sentiment")
     sentiment_backend = st.sidebar.selectbox("Sentiment backend", options=["nltk", "google"], index=0)
+    if sentiment_backend == "google" and not google_creds_present:
+        st.sidebar.warning("Google credentials not found. Set GOOGLE_APPLICATION_CREDENTIALS or st.secrets['google']['credentials'] to use Google NLP.")
     st.sidebar.caption("Google requires GOOGLE_APPLICATION_CREDENTIALS to be set or credentials provided via secrets.")
 
-    # Initialize session state
+    # Session state init
     if "pages" not in st.session_state:
         st.session_state.pages = []
     if "index" not in st.session_state:
         st.session_state.index = None
 
-    # Main controls
+    # Buttons and status widgets
     col1, col2 = st.columns([2, 1])
     with col1:
         start_crawl = st.button("Start crawl")
-        # note: stop button is still a placeholder in this version
         stop_crawl = st.button("Stop (not implemented)")
     with col2:
         st.write("Index status")
@@ -80,11 +81,15 @@ try:
         else:
             st.write("No pages indexed")
 
-    progress_bar = st.progress(0)
+    # Use dedicated placeholders for real-time updates
+    progress_placeholder = st.empty()
+    progress_bar = progress_placeholder.progress(0)
     status_text = st.empty()
     log_area = st.empty()
+    # A small area for a running indicator/ETA
+    running_info = st.empty()
 
-    # Load from MongoDB button (in sidebar)
+    # Load from Mongo
     st.sidebar.markdown("---")
     if st.sidebar.button("Load from MongoDB and build index"):
         if not mongo_uri:
@@ -101,19 +106,36 @@ try:
                 except Exception as e:
                     st.sidebar.error(f"Failed to load from MongoDB: {e}")
 
-    # Crawl logic: run crawler in background thread and poll queue for updates (so UI updates in real time)
+    # Helper for ETA calculation (simple)
+    def eta_text(start_ts, processed, total):
+        if processed <= 0:
+            return "ETA: calculating..."
+        elapsed = time.time() - start_ts
+        per_page = elapsed / processed
+        remaining = max(0, total - processed)
+        eta_secs = per_page * remaining
+        # human readable
+        if eta_secs < 60:
+            return f"ETA: {int(eta_secs)}s"
+        else:
+            mins = int(eta_secs // 60)
+            secs = int(eta_secs % 60)
+            return f"ETA: {mins}m {secs}s"
+
+    # Start crawl: validate Google credential case and prevent metadata calls
     if start_crawl:
-        # Validate start_url
-        if not start_url or not start_url.startswith("http"):
+        if sentiment_backend == "google" and not google_creds_present:
+            st.error(
+                "Google NLP selected but GOOGLE_APPLICATION_CREDENTIALS is not set. "
+                "Please set credentials in the environment or st.secrets['google']['credentials']."
+            )
+        elif not start_url or not start_url.startswith("http"):
             st.error("Please enter a valid http/https Start URL.")
         else:
-            st.info("Starting crawl — runs in a background thread; UI will update as pages are processed.")
+            st.info("Starting crawl — runs in a background thread; UI will update in real time.")
 
-            # Thread-safe queue for progress messages coming from the crawler thread
+            # Setup queue and thread
             q = queue.Queue()
-            crawl_thread_exception = {"exc": None}
-
-            # instantiate crawler
             crawler = Crawler(
                 start_url=start_url,
                 max_pages=int(max_pages),
@@ -124,60 +146,49 @@ try:
                 sentiment_backend=sentiment_backend,
             )
 
-            # on_page callback used by crawler thread -> queue
             def on_page_threadsafe(page):
-                # Put page into queue (background thread only writes to queue)
+                # the crawler thread places page events on the queue
                 q.put({"type": "page", "page": page})
 
-            # finalization marker
             def crawl_worker():
                 try:
                     crawler.crawl(progress_callback=None, on_page=on_page_threadsafe)
                     q.put({"type": "done"})
                 except Exception as e:
-                    # push error to queue so main thread can display it
                     q.put({"type": "error", "error": str(e)})
-                    crawl_thread_exception["exc"] = e
                     q.put({"type": "done"})
 
-            # Start background thread
             t = threading.Thread(target=crawl_worker, daemon=True)
-            # Reset pages in session state (we'll append as results come in)
+            # reset pages in session_state, start time for ETA
             st.session_state.pages = []
+            start_ts = time.time()
             t.start()
 
-            # Poll the queue and update UI until thread finishes (or queue empties)
             inserted_total = 0
             updated_total = 0
             save_errors = []
-
-            # Buffer for incremental save (only main thread performs Mongo writes)
             save_buffer = []
 
-            # Poll loop: continue while thread is alive or there are messages in the queue
+            # Poll queue loop: updates placed widgets on main thread (real-time)
             while t.is_alive() or not q.empty():
                 # Drain queue
                 while not q.empty():
-                    try:
-                        item = q.get_nowait()
-                    except queue.Empty:
-                        break
+                    item = q.get_nowait()
                     if item["type"] == "page":
                         page = item["page"]
-                        # Append to in-memory pages (main thread)
                         st.session_state.pages.append(page)
-
-                        # update progress bar and status
                         current = len(st.session_state.pages)
+                        # update progress bar and status
                         try:
                             percent = int((current / float(max_pages)) * 100)
                         except Exception:
                             percent = 0
                         progress_bar.progress(min(percent, 100))
                         status_text.markdown(f"Crawled {current}/{max_pages}: {page.get('url')}")
-                        log_area.text(f"Last: {page.get('url')} — total pages: {current}")
+                        log_area.text(f"Last: {page.get('url')}  |  Title: {page.get('title','')}")
+                        running_info.text(eta_text(start_ts, current, max_pages))
 
-                        # Add to local save buffer and persist in batches (main thread does DB writes)
+                        # batch save logic on main thread
                         save_buffer.append(page)
                         if len(save_buffer) >= int(batch_size):
                             if mongo_uri:
@@ -194,16 +205,14 @@ try:
                     elif item["type"] == "error":
                         st.error(f"Crawl thread error: {item.get('error')}")
                     elif item["type"] == "done":
-                        # thread finished; continue draining queue then break
+                        # final marker; we'll break out after draining queue
                         pass
 
-                # sleep briefly to yield control so UI updates are sent to browser
-                time.sleep(0.2)
-                # allow Streamlit to process and render updated widgets
-                # (no st.experimental_rerun here; we just loop and update widgets)
-                # If user navigates away or the script re-runs for other reasons, this loop may end.
+                # Yield to Streamlit so widget updates are rendered in browser
+                # short sleep ensures UI remains responsive and updates display
+                time.sleep(0.15)
 
-            # After thread completes, flush any remaining buffer
+            # flush any remaining buffer after crawl finishes
             if save_buffer:
                 if mongo_uri:
                     try:
@@ -216,12 +225,13 @@ try:
                         save_errors.append({"error": str(e)})
                 save_buffer.clear()
 
-            # Build index from collected pages
+            # Build index from the collected pages
             idx = SearchIndex()
             idx.build(st.session_state.pages)
             st.session_state.index = idx
 
             progress_bar.progress(100)
+            running_info.empty()
             st.success(f"Finished crawling: {len(st.session_state.pages)} pages collected.")
             st.write("Incremental save summary during crawl:")
             st.write(f"Total inserted (batches): {inserted_total}, total updated (batches): {updated_total}, batch errors: {len(save_errors)}")
@@ -242,7 +252,7 @@ try:
                         except Exception as e:
                             st.error(f"Error saving to MongoDB: {e}")
 
-    # --- Batch queries textbox (main UI) ---
+    # --- Batch queries UI ---
     st.markdown("---")
     st.subheader("Batch search queries")
     st.markdown("Enter one word or phrase per line. Press 'Run batch search' to execute searches for each line.")
@@ -257,17 +267,17 @@ try:
         else:
             queries = [line.strip() for line in batch_input.splitlines() if line.strip()]
             st.info(f"Running {len(queries)} queries...")
-            for q in queries:
-                is_phrase = " " in q.strip()
-                res = st.session_state.index.search(q, fields=["title","meta","text","alt","headings"], phrase=is_phrase, max_results=200)
-                st.markdown(f"#### Query: `{q}` — {len(res)} result(s)")
+            for q_line in queries:
+                is_phrase = " " in q_line.strip()
+                res = st.session_state.index.search(q_line, fields=["title","meta","text","alt","headings"], phrase=is_phrase, max_results=200)
+                st.markdown(f"#### Query: `{q_line}` — {len(res)} result(s)")
                 if res:
                     df = pd.DataFrame(res[:20])
                     st.dataframe(df)
                 else:
                     st.write("No results found.")
 
-    # --- Single-query search UI ---
+    # --- Single query UI ---
     st.markdown("---")
     st.subheader("Single query search")
     if not st.session_state.pages:
