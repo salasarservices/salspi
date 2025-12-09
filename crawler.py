@@ -8,6 +8,18 @@ from bs4 import BeautifulSoup
 from urllib import robotparser
 from collections import deque
 
+# Lazy imports for OCR
+try:
+    from PIL import Image
+    from io import BytesIO
+    import pytesseract
+    _HAS_OCR = True
+except Exception:
+    Image = None
+    BytesIO = None
+    pytesseract = None
+    _HAS_OCR = False
+
 # Do not perform heavy initialization at import time.
 _SIA = None
 try:
@@ -33,9 +45,8 @@ DEFAULT_HEADERS = {
 
 class Crawler:
     """
-    Crawler that supports sentiment via 'nltk' (VADER) or 'google' (Cloud Natural Language).
-    The google backend will only be used if GOOGLE_APPLICATION_CREDENTIALS is set (or you
-    explicitly set a credentials file prior to instantiation).
+    Crawler that supports extracting page text, meta, headings, images and performing OCR on images.
+    Sentiment via 'nltk' (VADER) or 'google' (Cloud Natural Language).
     """
 
     def __init__(
@@ -48,6 +59,7 @@ class Crawler:
         timeout=10,
         sentiment_backend="nltk",
         google_credentials_env_var=None,
+        ocr_enabled=True,
     ):
         self.start_url = start_url.rstrip("/")
         self.max_pages = int(max_pages)
@@ -75,6 +87,11 @@ class Crawler:
         # lazy init
         self._sia = None
         self._google_client = None
+
+        # OCR
+        self.ocr_enabled = bool(ocr_enabled) and _HAS_OCR
+        if ocr_enabled and not _HAS_OCR:
+            logger.warning("OCR requested but pytesseract/Pillow not available; OCR disabled.")
 
     def _init_robots(self):
         try:
@@ -126,28 +143,18 @@ class Crawler:
             self._sia = None
 
     def _ensure_google_client(self):
-        """
-        Lazily create a google language client but ONLY if explicit credentials are available.
-        We avoid attempting the metadata server by refusing to instantiate the client when
-        GOOGLE_APPLICATION_CREDENTIALS isn't set. This prevents metadata timeouts on non-GCE hosts.
-        """
         if not _HAS_GOOGLE:
             raise RuntimeError("google-cloud-language is not installed in the environment.")
-        # Require explicit credentials file env var to avoid metadata lookup
         creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         if not creds_path:
-            # do not attempt ADC/metadata; raise clear error
             raise RuntimeError(
-                "Google NLP requested but GOOGLE_APPLICATION_CREDENTIALS is not set. "
-                "Set the env var to a service-account JSON key path or provide credentials via streamlit secrets."
+                "Google NLP requested but GOOGLE_APPLICATION_CREDENTIALS is not set."
             )
         if self._google_client is None:
             try:
                 from google.cloud import language_v1
-
                 self._google_client = language_v1.LanguageServiceClient()
             except Exception as e:
-                # surface a helpful message and re-raise
                 logger.exception("Failed to instantiate Google Language client: %s", e)
                 raise
         return self._google_client
@@ -170,16 +177,12 @@ class Crawler:
         try:
             client = self._ensure_google_client()
             from google.cloud import language_v1
-
             document = language_v1.Document(content=text, type_=language_v1.Document.Type.PLAIN_TEXT)
-            response = client.analyze_sentiment(
-                request={"document": document, "encoding_type": language_v1.EncodingType.UTF8}
-            )
+            response = client.analyze_sentiment(request={"document": document, "encoding_type": language_v1.EncodingType.UTF8})
             score = response.document_sentiment.score
             magnitude = response.document_sentiment.magnitude
             return {"score": float(score), "magnitude": float(magnitude), "compound": float(score), "backend": "google"}
         except Exception as e:
-            # Do not propagate metadata/refresh errors upstream; return safe fallback with error note
             logger.exception("Google NLP sentiment failed: %s", e)
             return {"score": 0.0, "magnitude": 0.0, "compound": 0.0, "backend": "google", "error": str(e)}
 
@@ -188,6 +191,38 @@ class Crawler:
             return self._analyze_sentiment_google(text)
         else:
             return self._analyze_sentiment_nltk(text)
+
+    def _perform_ocr_on_image(self, img_url: str):
+        """
+        Download an image and run OCR returning the extracted text.
+        Returns {'ocr_text': str, 'error': str or None}
+        """
+        if not self.ocr_enabled:
+            return {"ocr_text": "", "error": "ocr-disabled"}
+        try:
+            # small safety: do not download extremely large images
+            resp = requests.get(img_url, headers=self.headers, timeout=self.timeout, stream=True)
+            content_type = resp.headers.get("Content-Type", "")
+            if resp.status_code != 200 or not content_type.startswith("image"):
+                return {"ocr_text": "", "error": f"non-image or status {resp.status_code}"}
+            # limit read to e.g. 5MB
+            max_bytes = 5 * 1024 * 1024
+            content = resp.raw.read(max_bytes + 1)
+            if len(content) > max_bytes:
+                return {"ocr_text": "", "error": "image-too-large"}
+            img = Image.open(BytesIO(content)).convert("RGB")
+            # optionally pre-process: resize if huge
+            w, h = img.size
+            max_dim = 2500
+            if max(w, h) > max_dim:
+                ratio = max_dim / float(max(w, h))
+                new_size = (int(w * ratio), int(h * ratio))
+                img = img.resize(new_size)
+            text = pytesseract.image_to_string(img)
+            return {"ocr_text": text.strip(), "error": None}
+        except Exception as e:
+            logger.debug("OCR failed for %s: %s", img_url, e)
+            return {"ocr_text": "", "error": str(e)}
 
     def _extract(self, html, url):
         soup = BeautifulSoup(html, "lxml")
@@ -198,17 +233,28 @@ class Crawler:
         if desc_tag and desc_tag.get("content"):
             meta_desc = desc_tag["content"].strip()
 
-        # remove script/style
+        # remove scripts/styles
         for script in soup(["script", "style", "noscript"]):
             script.decompose()
         text = soup.get_text(separator=" ", strip=True)
 
         images = []
+        ocr_texts = []
         for img in soup.find_all("img"):
             src = img.get("src") or ""
             alt = img.get("alt") or ""
             src = urljoin(url, src)
-            images.append({"src": src, "alt": alt})
+            img_entry = {"src": src, "alt": alt}
+            # attempt OCR for each image (may be empty if disabled or failed)
+            try:
+                ocr_res = self._perform_ocr_on_image(src) if self.ocr_enabled else {"ocr_text": "", "error": "ocr-disabled"}
+            except Exception as e:
+                ocr_res = {"ocr_text": "", "error": str(e)}
+            img_entry["ocr_text"] = ocr_res.get("ocr_text", "")
+            img_entry["ocr_error"] = ocr_res.get("error")
+            if img_entry["ocr_text"]:
+                ocr_texts.append(img_entry["ocr_text"])
+            images.append(img_entry)
 
         # headings
         h_counts = {}
@@ -231,8 +277,12 @@ class Crawler:
         meta_len = len(meta_desc)
         content_len = len(text)
 
+        # sentiment source
         sentiment_source = " ".join([title_tag, meta_desc, headings_text, text])
         sentiment = self._analyze_sentiment(sentiment_source)
+
+        # aggregate OCR text for the page
+        ocr_aggregate = " ".join([t for t in ocr_texts if t])
 
         return {
             "url": url,
@@ -248,6 +298,9 @@ class Crawler:
             "headings": headings_text,
             "links": links,
             "sentiment": sentiment,
+            # OCR
+            "ocr_text": ocr_aggregate,
+            "ocr_details": images,  # per-image src/alt/ocr_text/ocr_error
         }
 
     def crawl(self, progress_callback=None, on_page=None):
