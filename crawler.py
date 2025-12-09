@@ -8,26 +8,20 @@ from bs4 import BeautifulSoup
 from urllib import robotparser
 from collections import deque
 
-# NLTK VADER fallback
+# Do NOT run downloads or heavy initialization at import time.
+# We'll lazily initialize NLTK VADER and Google client inside the Crawler instance.
+_SIA = None
 try:
-    from nltk.sentiment import SentimentIntensityAnalyzer
     import nltk
-    try:
-        nltk.data.find("sentiment/vader_lexicon.zip")
-    except Exception:
-        try:
-            nltk.download("vader_lexicon")
-        except Exception:
-            pass
-    _SIA = SentimentIntensityAnalyzer()
 except Exception:
-    _SIA = None
+    nltk = None
 
-# Google Cloud client (optional)
+# Google Cloud client marker
 try:
-    from google.cloud import language_v1
+    from google.cloud import language_v1  # may not be installed
     _HAS_GOOGLE = True
 except Exception:
+    language_v1 = None
     _HAS_GOOGLE = False
 
 logger = logging.getLogger("site_crawler")
@@ -37,61 +31,64 @@ DEFAULT_HEADERS = {
     "User-Agent": "site-crawler-bot/1.0 (+https://example.com)"
 }
 
+
 class Crawler:
     """
-    Crawler with optional sentiment backend. To persist pages during crawl, pass an on_page callback:
-      def on_page(page): ...
-    The on_page callback is called immediately after a page is successfully extracted.
+    Robust crawler that lazily initializes sentiment backends to avoid import-time failures.
+    Use sentiment_backend="nltk" or "google".
+    on_page callback will be called per page (useful for incremental save).
     """
     def __init__(self, start_url, max_pages=2000, delay=0.5, same_domain=True, headers=None, timeout=10,
                  sentiment_backend="nltk", google_credentials_env_var=None):
         self.start_url = start_url.rstrip("/")
-        self.max_pages = max_pages
-        self.delay = delay
-        self.same_domain = same_domain
+        self.max_pages = int(max_pages)
+        self.delay = float(delay)
+        self.same_domain = bool(same_domain)
         self.headers = headers or DEFAULT_HEADERS
-        self.timeout = timeout
+        self.timeout = int(timeout)
 
         parsed = urlparse(self.start_url)
         self.root_netloc = parsed.netloc
         self.scheme = parsed.scheme
 
         self.visited = set()
-        self.results = []  # list of dicts per page
+        self.results = []
         self.rp = robotparser.RobotFileParser()
         self._init_robots()
 
-        # sentiment backend: "nltk" or "google"
-        self.sentiment_backend = sentiment_backend.lower() if sentiment_backend else "nltk"
-
-        # optionally set credentials env var for google client (if provided)
+        # sentiment backend choice
+        self.sentiment_backend = (sentiment_backend or "nltk").lower()
+        # optional credentials env var name or path
         if google_credentials_env_var:
-            # caller should set os.environ[google_credentials_env_var] to a path or JSON string prior to initialization.
             os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", google_credentials_env_var)
 
-        # lazy init google client only if requested
+        # lazy-initialized clients
+        self._sia = None
         self._google_client = None
 
     def _init_robots(self):
-        robots_url = urljoin(f"{self.scheme}://{self.root_netloc}", "/robots.txt")
         try:
+            robots_url = urljoin(f"{self.scheme}://{self.root_netloc}", "/robots.txt")
             self.rp.set_url(robots_url)
             self.rp.read()
         except Exception:
-            # ignore robots failures and assume allowed
-            logger.info("Could not read robots.txt, proceeding without it.")
+            logger.info("Could not read robots.txt; proceeding without it.")
 
     def _allowed(self, url):
         try:
-            return self.rp.can_fetch(self.headers.get("User-Agent", "*"), url)
+            ua = self.headers.get("User-Agent", "*")
+            return self.rp.can_fetch(ua, url)
         except Exception:
             return True
 
     def _same_domain(self, url):
         if not self.same_domain:
             return True
-        parsed = urlparse(url)
-        return parsed.netloc == self.root_netloc
+        try:
+            parsed = urlparse(url)
+            return parsed.netloc == self.root_netloc
+        except Exception:
+            return False
 
     def _normalize(self, link, base):
         if not link:
@@ -101,35 +98,54 @@ class Crawler:
             return None
         return urljoin(base, link.split("#")[0])
 
+    def _ensure_nltk(self):
+        # Lazily initialize the NLTK VADER analyzer if available
+        global _SIA
+        if _SIA is not None:
+            self._sia = _SIA
+            return
+        if nltk is None:
+            self._sia = None
+            return
+        try:
+            from nltk.sentiment import SentimentIntensityAnalyzer
+            # Do NOT call nltk.download here in production; assume the env already has the data.
+            # If the lexicon is missing, initialize will raise; catch and fallback to None.
+            self._sia = SentimentIntensityAnalyzer()
+            _SIA = self._sia
+        except Exception:
+            # fallback: leave _sia as None
+            self._sia = None
+
     def _ensure_google_client(self):
         if not _HAS_GOOGLE:
-            raise RuntimeError("google-cloud-language library not available (not installed).")
-        if not self._google_client:
+            raise RuntimeError("google-cloud-language is not installed")
+        if self._google_client is None:
+            # lazily create client (uses GOOGLE_APPLICATION_CREDENTIALS env var)
+            from google.cloud import language_v1
             self._google_client = language_v1.LanguageServiceClient()
         return self._google_client
 
     def _analyze_sentiment_nltk(self, text: str):
-        if not text or _SIA is None:
+        if self._sia is None:
+            self._ensure_nltk()
+        if not text or self._sia is None:
             return {"compound": 0.0, "pos": 0.0, "neu": 1.0, "neg": 0.0, "backend": "nltk"}
         try:
-            scores = _SIA.polarity_scores(text)
+            scores = self._sia.polarity_scores(text)
             scores["backend"] = "nltk"
             return scores
         except Exception:
             return {"compound": 0.0, "pos": 0.0, "neu": 1.0, "neg": 0.0, "backend": "nltk"}
 
     def _analyze_sentiment_google(self, text: str):
-        """
-        Returns: {"score": float, "magnitude": float, "backend": "google"}.
-        Also include "compound" key mapped to score for compatibility.
-        """
         if not text:
             return {"score": 0.0, "magnitude": 0.0, "compound": 0.0, "backend": "google"}
         try:
             client = self._ensure_google_client()
+            from google.cloud import language_v1
             document = language_v1.Document(content=text, type_=language_v1.Document.Type.PLAIN_TEXT)
             response = client.analyze_sentiment(request={'document': document, 'encoding_type': language_v1.EncodingType.UTF8})
-            # overall document sentiment
             score = response.document_sentiment.score
             magnitude = response.document_sentiment.magnitude
             return {"score": float(score), "magnitude": float(magnitude), "compound": float(score), "backend": "google"}
@@ -152,7 +168,6 @@ class Crawler:
         if desc_tag and desc_tag.get("content"):
             meta_desc = desc_tag["content"].strip()
 
-        # remove script/style
         for script in soup(["script", "style", "noscript"]):
             script.decompose()
         text = soup.get_text(separator=" ", strip=True)
@@ -164,7 +179,6 @@ class Crawler:
             src = urljoin(url, src)
             images.append({"src": src, "alt": alt})
 
-        # headings
         h_counts = {}
         headings_text_parts = []
         for i in range(1, 7):
@@ -173,7 +187,6 @@ class Crawler:
             h_counts[tag] = len(found)
             for fh in found:
                 headings_text_parts.append(fh.get_text(" ", strip=True))
-
         headings_text = " ".join([p for p in headings_text_parts if p])
 
         links = []
@@ -206,11 +219,6 @@ class Crawler:
         }
 
     def crawl(self, progress_callback=None, on_page=None):
-        """
-        Breadth-first crawl from start_url until max_pages or queue exhausted.
-        progress_callback(current_count, max_pages, last_url) can be provided.
-        on_page(page_dict) will be called for each extracted page (useful for incremental persistence).
-        """
         q = deque([self.start_url])
         self.visited = set()
         self.results = []
@@ -224,7 +232,7 @@ class Crawler:
             if not self._same_domain(url):
                 continue
             if not self._allowed(url):
-                logger.debug(f"Blocked by robots: {url}")
+                logger.debug("Blocked by robots: %s", url)
                 self.visited.add(url)
                 continue
 
@@ -232,24 +240,23 @@ class Crawler:
                 resp = requests.get(url, headers=self.headers, timeout=self.timeout)
                 content_type = resp.headers.get("Content-Type", "")
                 if resp.status_code != 200 or "html" not in content_type:
-                    logger.debug(f"Skipping non-HTML or non-200: {url} ({resp.status_code})")
+                    logger.debug("Skipping non-HTML or non-200: %s (%s)", url, resp.status_code)
                     self.visited.add(url)
                     if progress_callback:
                         progress_callback(len(self.results), self.max_pages, url)
                     continue
+
                 page = self._extract(resp.text, url)
                 self.results.append(page)
                 self.visited.add(url)
 
-                # call per-page callback for persistence
                 if on_page:
                     try:
                         on_page(page)
                     except Exception:
                         logger.exception("on_page callback raised an exception")
 
-                # enqueue discovered links
-                for link in page["links"]:
+                for link in page.get("links", []):
                     if link not in self.visited and link not in q:
                         if self._same_domain(link):
                             q.append(link)
@@ -259,9 +266,10 @@ class Crawler:
 
                 time.sleep(self.delay)
             except Exception as e:
-                logger.debug(f"Error fetching {url}: {e}")
+                logger.exception("Error fetching %s: %s", url, e)
                 self.visited.add(url)
                 if progress_callback:
                     progress_callback(len(self.results), self.max_pages, url)
                 time.sleep(self.delay)
+
         return self.results
