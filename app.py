@@ -280,15 +280,111 @@ try:
             save_errors = []
             save_buffer = []
 
-            # Poll queue loop: updates placed widgets on main thread (real-time)
-            while t.is_alive() or not q.empty():
-                # Drain queue
-                while not q.empty():
-                    item = q.get_nowait()
-                    if item["type"] == "page":
-                        page = item["page"]
-                        st.session_state.pages.append(page)
-                        current = len(st.session_state.pages)
+            # --- Replace your current poll loop with this block ---
+# t is the background thread; q is queue.Queue populated by the crawler thread
+inserted_total = 0
+updated_total = 0
+ocr_inserted = 0
+ocr_updated = 0
+save_errors = []
+save_buffer = []
+start_ts = time.time()
+
+# Short helper to force safe widget updates (keeps UI responsive)
+def update_ui_counts(current, inserted_total, updated_total, ocr_inserted, ocr_updated, save_errors, start_ts):
+    percent = int((current / float(MAX_PAGES)) * 100)
+    percent = max(0, min(100, percent))
+    progress_bar.progress(percent)
+    percent_text_ph.markdown(f"Completion: {percent}%")
+    pages_crawled_ph.metric("Pages crawled", f"{current}")
+    pages_saved_ph.metric("Pages saved", f"{inserted_total + updated_total}")
+    ocr_saved_ph.metric("OCR docs saved", f"{ocr_inserted + ocr_updated}")
+    errors_ph.metric("Batch errors", f"{len(save_errors)}")
+    running_info.text(eta_text(start_ts, current, MAX_PAGES))
+
+# Poll the queue and update UI in small steps.
+# This loop yields frequently so Streamlit can send updates to the browser.
+while t.is_alive() or not q.empty():
+    # Drain queue completely before sleeping (fast)
+    drained = False
+    while not q.empty():
+        drained = True
+        item = q.get_nowait()
+        if item["type"] == "page":
+            page = item["page"]
+            st.session_state.pages.append(page)
+            current = len(st.session_state.pages)
+
+            # immediate UI update
+            status_text.markdown(f"Crawled {current}/{MAX_PAGES}: {page.get('url')}")
+            log_area.text(f"Last: {page.get('url')}  |  Title: {page.get('title','')}")
+            update_ui_counts(current, inserted_total, updated_total, ocr_inserted, ocr_updated, save_errors, start_ts)
+
+            # append to buffer for DB writes
+            save_buffer.append(page)
+            if len(save_buffer) >= BATCH_SAVE_SIZE:
+                if mongo_uri:
+                    try:
+                        summary = save_pages_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, upsert=True)
+                        inserted_total += summary.get("inserted", 0)
+                        updated_total += summary.get("updated", 0)
+                        if summary.get("errors"):
+                            save_errors.extend(summary.get("errors"))
+                    except Exception as e:
+                        save_errors.append({"error": str(e)})
+                    try:
+                        ocr_summary = save_ocr_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name="ocr-data", upsert=True)
+                        ocr_inserted += ocr_summary.get("inserted", 0)
+                        ocr_updated += ocr_summary.get("updated", 0)
+                        if ocr_summary.get("errors"):
+                            save_errors.extend(ocr_summary.get("errors"))
+                    except Exception as e:
+                        save_errors.append({"ocr_error": str(e)})
+                save_buffer.clear()
+                # update counts after write
+                update_ui_counts(len(st.session_state.pages), inserted_total, updated_total, ocr_inserted, ocr_updated, save_errors, start_ts)
+
+        elif item["type"] == "error":
+            st.error(f"Crawl thread error: {item.get('error')}")
+        elif item["type"] == "done":
+            # nothing special — loop will exit when t.is_alive() is False and queue empty
+            pass
+
+    # Important: small sleep so Streamlit can push updates to browser and keep animation fluid.
+    # This is the critical bit — keep this value small (0.1..0.25 sec).
+    if not drained:
+        # if nothing new, sleep a tiny bit
+        time.sleep(0.12)
+    else:
+        # if we drained items, yield briefly to make UI draw changes
+        time.sleep(0.08)
+
+# After thread completes, flush any remaining save_buffer (same as before)
+if save_buffer:
+    if mongo_uri:
+        try:
+            summary = save_pages_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, upsert=True)
+            inserted_total += summary.get("inserted", 0)
+            updated_total += summary.get("updated", 0)
+            if summary.get("errors"):
+                save_errors.extend(summary.get("errors"))
+        except Exception as e:
+            save_errors.append({"error": str(e)})
+        try:
+            ocr_summary = save_ocr_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name="ocr-data", upsert=True)
+            ocr_inserted += ocr_summary.get("inserted", 0)
+            ocr_updated += ocr_summary.get("updated", 0)
+            if ocr_summary.get("errors"):
+                save_errors.extend(ocr_summary.get("errors"))
+        except Exception as e:
+            save_errors.append({"ocr_error": str(e)})
+    save_buffer.clear()
+
+# Final UI update
+total = len(st.session_state.pages)
+update_ui_counts(total, inserted_total, updated_total, ocr_inserted, ocr_updated, save_errors, start_ts)
+progress_bar.progress(min(int((total/float(MAX_PAGES))*100), 100))
+percent_text_ph.markdown(f"Completion: {int((total/float(MAX_PAGES))*100)}%")
 
                         # update progress percentage and bar
                         percent = int((current / float(MAX_PAGES)) * 100)
