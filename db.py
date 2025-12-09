@@ -12,6 +12,8 @@ except Exception:
     _SECRETS = None
 
 from pymongo import MongoClient, errors
+from bson import ObjectId
+from bson.errors import InvalidId
 
 # Local fallback directory used when MongoDB is unreachable
 LOCAL_FALLBACK_DIR = os.environ.get("LOCAL_CRAWL_DIR", "local_crawls")
@@ -27,7 +29,6 @@ def _config_from_secrets_or_env():
     # 1) streamlit secrets (if running inside Streamlit)
     if _SECRETS and "mongo" in _SECRETS:
         sm = _SECRETS["mongo"]
-        # allow either a single uri entry or separate user/password + host fields
         cfg["uri"] = sm.get("uri") or None
         cfg["db"] = sm.get("db") or sm.get("database") or os.environ.get("MONGO_DB_NAME")
         cfg["collection"] = sm.get("collection") or os.environ.get("MONGO_COLLECTION")
@@ -51,23 +52,19 @@ def _local_file_for_site(site):
 def _validate_uri(uri):
     """
     Basic validation: check common placeholder patterns and provide helpful error.
-    Also URL-encode credentials if provided separately (not needed if full uri already).
     """
     if not uri:
         raise ValueError("No Mongo URI provided. Put it in Streamlit secrets or set MONGO_URI env var.")
-    if "<" in uri or ">" in uri or "password" in uri.lower() and "@" in uri:
-        # This detects strings like mongodb+srv://user:<password>@...
+    if "<" in uri or ">" in uri or ("<password" in uri.lower()):
         raise ValueError(
             "Your Mongo URI contains a placeholder like <password>. Replace it with the real password "
-            "in .streamlit/secrets.toml or an environment variable. If the password contains special characters, "
-            "URL-encode it (use urllib.parse.quote_plus)."
+            "in .streamlit/secrets.toml or an environment variable. URL-encode special characters in the password."
         )
     return uri
 
 def get_config():
     """Return resolved config (uri, db, collection)."""
-    cfg = _config_from_secrets_or_env()
-    return cfg
+    return _config_from_secrets_or_env()
 
 def get_client(timeout_ms=5000):
     """
@@ -77,10 +74,8 @@ def get_client(timeout_ms=5000):
     cfg = _config_from_secrets_or_env()
     uri = cfg.get("uri")
     uri = _validate_uri(uri)
-    # Pass the URI directly; for mongodb+srv, tls is on by default
     client = MongoClient(uri, serverSelectionTimeoutMS=timeout_ms)
-    # Force server selection to raise early if unreachable
-    client.server_info()
+    client.server_info()  # force early exception if unreachable
     return client
 
 def is_connected():
@@ -91,6 +86,38 @@ def is_connected():
     except Exception:
         return False
 
+def _make_json_serializable(obj):
+    """
+    Recursively convert BSON types (ObjectId, datetime) to JSON serializable Python types.
+    Leaves other types as-is.
+    """
+    if isinstance(obj, ObjectId):
+        return str(obj)
+    if isinstance(obj, datetime):
+        return obj.isoformat() + "Z"
+    if isinstance(obj, dict):
+        return {k: _make_json_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_make_json_serializable(v) for v in obj]
+    # other BSON types (Decimal128, Binary, etc.) can be added if needed
+    return obj
+
+def _serialize_doc(doc):
+    """
+    Convert a single MongoDB doc or local doc to JSON-serializable form.
+    """
+    if doc is None:
+        return None
+    # If the doc is a pymongo Cursor/SON, convert to dict-like then process
+    try:
+        return _make_json_serializable(doc)
+    except Exception:
+        # As a fallback, attempt a naive json dump/load to coerce types
+        try:
+            return json.loads(json.dumps(doc, default=str))
+        except Exception:
+            return doc
+
 def save_crawl(site, crawl):
     """
     Save crawl. Try MongoDB first; fallback to local JSON file if unreachable.
@@ -98,7 +125,7 @@ def save_crawl(site, crawl):
     """
     doc = {
         "site": site,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.utcnow(),
         "crawl": crawl
     }
     cfg = _config_from_secrets_or_env()
@@ -120,7 +147,13 @@ def save_crawl(site, crawl):
                     existing = json.load(f)
             except Exception:
                 existing = []
-        existing.append(doc)
+        # store a serializable version (convert datetime to ISO)
+        serial_doc = {
+            "site": site,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "crawl": crawl
+        }
+        existing.append(serial_doc)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(existing, f, indent=2, ensure_ascii=False)
         return path
@@ -128,6 +161,7 @@ def save_crawl(site, crawl):
 def latest_crawl(site):
     """
     Return the latest crawl document for site. Try MongoDB first, then fallback to local JSON.
+    Always returns JSON-serializable dict (ObjectId and datetime converted).
     """
     cfg = _config_from_secrets_or_env()
     try:
@@ -136,7 +170,7 @@ def latest_crawl(site):
         col = db[cfg["collection"]]
         doc = col.find_one({"site": site}, sort=[("timestamp", -1)])
         client.close()
-        return doc
+        return _serialize_doc(doc)
     except Exception:
         path = _local_file_for_site(site)
         if not os.path.exists(path):
@@ -152,6 +186,9 @@ def latest_crawl(site):
             return None
 
 def list_crawls(site, limit=10):
+    """
+    Return a list of recent crawl documents for `site`. Always JSON-serializable.
+    """
     cfg = _config_from_secrets_or_env()
     try:
         client = get_client()
@@ -159,7 +196,7 @@ def list_crawls(site, limit=10):
         col = db[cfg["collection"]]
         docs = list(col.find({"site": site}).sort("timestamp", -1).limit(limit))
         client.close()
-        return docs
+        return [_serialize_doc(d) for d in docs]
     except Exception:
         path = _local_file_for_site(site)
         if not os.path.exists(path):
