@@ -101,33 +101,34 @@ if run:
                           headers={"User-Agent": user_agent}, timeout=int(timeout),
                           sentiment_backend=sentiment_backend)
 
-        # incremental save buffer
+        # incremental save buffer and stats (use mutable dict to avoid nonlocal)
         save_buffer = []
-        total_saved = 0
-        total_updated = 0
-        save_errors = []
+        stats = {"inserted": 0, "updated": 0, "errors": []}
 
         def on_page_callback(page):
-            # Called per page during crawl. Append to session pages and buffer for persistence.
+            """
+            Called per page during crawl. Append to session pages and buffer for persistence.
+            Uses the outer 'save_buffer' list and 'stats' dict (mutated directly).
+            """
+            # update in-memory pages
             st.session_state.pages.append(page)
             save_buffer.append(page)
-            nonlocal total_saved, total_updated, save_errors
+
+            # When buffer reaches batch_size, persist to Mongo (if configured)
             if len(save_buffer) >= batch_size:
                 if mongo_uri:
                     try:
                         summary = save_pages_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, upsert=True)
-                        total_saved += summary.get("inserted", 0)
-                        total_updated += summary.get("updated", 0)
+                        stats["inserted"] += summary.get("inserted", 0)
+                        stats["updated"] += summary.get("updated", 0)
                         if summary.get("errors"):
-                            save_errors.extend(summary.get("errors"))
-                            st.warning(f"Batch saved with {len(summary['errors'])} errors (see logs).")
+                            stats["errors"].extend(summary.get("errors"))
+                            # small informational notification
+                            st.warning(f"A batch save completed with {len(summary['errors'])} errors (check logs).")
                     except Exception as e:
-                        save_errors.append({"error": str(e)})
+                        stats["errors"].append({"error": str(e)})
                         st.error(f"Batch save failed: {e}")
-                else:
-                    # no mongo configured; just skip saving
-                    pass
-                # clear the buffer after attempt
+                # clear the buffer after attempt (whether or not saved)
                 save_buffer.clear()
 
         def progress_cb(current, maximum, last_url):
@@ -152,12 +153,12 @@ if run:
             if mongo_uri:
                 try:
                     summary = save_pages_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, upsert=True)
-                    total_saved += summary.get("inserted", 0)
-                    total_updated += summary.get("updated", 0)
+                    stats["inserted"] += summary.get("inserted", 0)
+                    stats["updated"] += summary.get("updated", 0)
                     if summary.get("errors"):
-                        save_errors.extend(summary.get("errors"))
+                        stats["errors"].extend(summary.get("errors"))
                 except Exception as e:
-                    save_errors.append({"error": str(e)})
+                    stats["errors"].append({"error": str(e)})
             save_buffer.clear()
 
         st.session_state.pages = pages or st.session_state.pages
@@ -185,9 +186,9 @@ if run:
 
         # show save summary (from incremental batches)
         st.write("Incremental save summary during crawl:")
-        st.write(f"Total inserted (batches): {total_saved}, total updated (batches): {total_updated}, batch errors: {len(save_errors)}")
-        if save_errors:
-            st.write(save_errors[:5])
+        st.write(f"Total inserted (batches): {stats['inserted']}, total updated (batches): {stats['updated']}, batch errors: {len(stats['errors'])}")
+        if stats["errors"]:
+            st.write(stats["errors"][:5])
 
 st.markdown("---")
 
