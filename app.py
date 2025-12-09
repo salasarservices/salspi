@@ -5,6 +5,20 @@ import sys
 # Configure page early
 st.set_page_config(page_title="Website Crawler & Search", layout="wide")
 
+
+def safe_rerun():
+    """
+    Best-effort rerun: call Streamlit's experimental rerun if available.
+    Some Streamlit builds may not expose experimental_rerun, so this will silently no-op.
+    """
+    try:
+        rerun = getattr(st, "experimental_rerun", None)
+        if callable(rerun):
+            rerun()
+    except Exception:
+        pass
+
+
 try:
     import os
     import threading
@@ -14,7 +28,7 @@ try:
     import pandas as pd
     from io import StringIO
 
-    # App modules (assumed present in repo)
+    # App modules (must exist in repo)
     from crawler import Crawler
     from search_index import SearchIndex
     from db import (
@@ -30,19 +44,6 @@ try:
     DEFAULT_SEARCH_FIELDS = ["title", "meta", "text", "alt", "headings", "ocr"]
 
     # --- Helpers ---
-    def safe_rerun():
-        """
-        Call Streamlit's experimental rerun if available; otherwise no-op.
-        Some Streamlit builds may not expose experimental_rerun, so we guard it.
-        """
-        try:
-            rerun = getattr(st, "experimental_rerun", None)
-            if callable(rerun):
-                rerun()
-        except Exception:
-            # best-effort only
-            pass
-
     def eta_text(start_ts, processed, total):
         if processed <= 0:
             return "ETA: calculating..."
@@ -93,6 +94,15 @@ try:
         st.session_state.crawl_start_ts = None
     if "crawl_stats" not in st.session_state:
         st.session_state.crawl_stats = {"inserted": 0, "updated": 0, "ocr_inserted": 0, "ocr_updated": 0, "errors": []}
+
+    # Ensure crawl_running reflects actual thread liveness (reset if thread is gone)
+    _thread = st.session_state.get("crawl_thread")
+    if _thread is None or not getattr(_thread, "is_alive", lambda: False)():
+        st.session_state.crawl_running = False
+        # clear queue references if thread died
+        if st.session_state.get("crawl_thread") is None:
+            # keep queue if present (it may contain un-drained events) — do not delete here
+            pass
 
     # --- UI Header ---
     st.title("Website Crawler & Search")
@@ -180,7 +190,6 @@ try:
                 del st.session_state[k]
             except Exception:
                 pass
-        # best-effort rerun (may be no-op in some Streamlit builds)
         safe_rerun()
 
     # --- Main controls ---
@@ -269,7 +278,7 @@ try:
             else:
                 start_crawl_background()
                 st.info(f"Starting crawl — runs in background; indexing up to {MAX_PAGES} pages.")
-                # no explicit rerun required; the queue-drain logic below will run in this execution
+                # No explicit rerun needed; the queue-drain logic below will run during this execution
 
     # --- Queue draining & UI update loop (main thread only) ---
     q = st.session_state.get("crawl_queue")
@@ -344,7 +353,7 @@ try:
         if st.session_state.crawl_thread is not None and st.session_state.crawl_thread.is_alive():
             # brief sleep to avoid tight loop; then continue (no rerun required)
             time.sleep(0.12)
-            # Re-run the same script context (no-op if experimental_rerun unavailable)
+            # best-effort rerun to let Streamlit refresh UI (may be no-op)
             safe_rerun()
         else:
             # worker finished; flush remaining buffer and finalize
@@ -378,7 +387,7 @@ try:
 
             # Final UI update
             total = len(st.session_state.pages)
-            final_pct = int((total / float(MAX_PAGES)) * 100)
+            final_pct = int((total / float(MAX_PAGES)) * 100) if MAX_PAGES > 0 else 100
             final_pct = max(0, min(100, final_pct))
             progress_bar.progress(final_pct)
             percent_ph.markdown(f"Completion: {final_pct}%")
