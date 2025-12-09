@@ -17,12 +17,14 @@ class SearchIndex:
         for p in pages:
             url = p["url"]
             self.pages[url] = p
-            # index title, meta, text, image alts
+            # index title, meta, text, headings, image alts, ocr
             fields = {
                 "title": p.get("title", "") or "",
                 "meta": p.get("meta", "") or "",
                 "text": p.get("text", "") or "",
-                "alt": " ".join(img.get("alt", "") for img in p.get("images", []))
+                "alt": " ".join(p.get("image_alts", [])) or "",
+                "headings": p.get("headings", "") or "",
+                "ocr": p.get("ocr_text", "") or ""
             }
             for field_name, content in fields.items():
                 # store snippets per word
@@ -41,10 +43,10 @@ class SearchIndex:
 
     def search(self, query: str, fields: List[str]=None, phrase: bool=False, max_results=500):
         """
-        fields: list of field names to search: title, meta, text, alt
+        fields: list of field names to search: title, meta, text, alt, headings, ocr
         phrase: if True, perform substring search over selected fields; else token search
         """
-        fields = fields or ["title", "meta", "text", "alt"]
+        fields = fields or ["title", "meta", "text", "alt", "headings", "ocr"]
         q = query.strip().lower()
         results = []
         seen = set()
@@ -54,7 +56,8 @@ class SearchIndex:
                 for f in fields:
                     content = p.get("_fields", {}).get(f, "")
                     if q in content.lower():
-                        snippet = self._make_snippet(content, content.lower().index(q), content.lower().index(q)+len(q))
+                        idx = content.lower().index(q)
+                        snippet = self._make_snippet(content, idx, idx+len(q))
                         key = (url, f)
                         if key not in seen:
                             results.append({"url": url, "field": f, "snippet": snippet, "title": p.get("title", "")})
@@ -70,7 +73,6 @@ class SearchIndex:
 
         # gather candidates for first token
         candidates = [entry for entry in self.inverted.get(tokens[0], []) if entry["field"] in fields]
-        # use a mapping url->matches
         url_hits = {}
         for c in candidates:
             url = c["url"]
@@ -81,16 +83,13 @@ class SearchIndex:
             next_urls = {}
             for e in next_entries:
                 next_urls.setdefault(e["url"], []).append(e)
-            # keep intersection
             url_hits = {url: url_hits[url] + next_urls[url] for url in list(url_hits.keys()) if url in next_urls}
 
-        # convert to result list
         for url, hits in url_hits.items():
             page = self.pages.get(url, {})
             snippets = "; ".join(h["snippet"] for h in hits[:3])
             results.append({"url": url, "title": page.get("title", ""), "snippets": snippets, "count": len(hits)})
             if len(results) >= max_results:
                 break
-        # sort by count desc
         results.sort(key=lambda x: x.get("count", 0), reverse=True)
         return results
