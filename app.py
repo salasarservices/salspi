@@ -1,16 +1,16 @@
-# streamlit_app.py (modified to add MongoDB save and batch search textbox)
 import streamlit as st
 import pandas as pd
 from crawler import Crawler
 from search_index import SearchIndex
-from db import save_pages_to_mongo
+from db import save_pages_to_mongo, load_pages_from_mongo
 import time
 from io import StringIO
+import os
 
 st.set_page_config(page_title="Website Crawler & Search", layout="wide")
 
 st.title("Website Crawler & Search")
-st.markdown("Crawl a site (limited pages) and search words/phrases in titles, descriptions, body text and image alt tags.")
+st.markdown("Crawl a site (limited pages) and search words/phrases in titles, descriptions, body text, image alt tags and headings. Sentiment backend selectable (NLTK or Google NLP).")
 
 # Sidebar: crawl settings
 st.sidebar.header("Crawl settings")
@@ -18,17 +18,38 @@ start_url = st.sidebar.text_input("Start URL (including http:// or https://)", v
 max_pages = st.sidebar.number_input("Max pages to crawl", min_value=1, max_value=2000, value=500, step=50)
 delay = st.sidebar.slider("Delay between requests (seconds)", min_value=0.0, max_value=5.0, value=0.5, step=0.1)
 same_domain = st.sidebar.checkbox("Restrict to same domain", True)
-
 st.sidebar.markdown("Advanced")
 user_agent = st.sidebar.text_input("User-Agent header", value="site-crawler-bot/1.0")
 timeout = st.sidebar.number_input("Request timeout (s)", min_value=1, value=10)
 
-# Sidebar: MongoDB settings
-st.sidebar.header("MongoDB (optional)")
-mongo_uri = st.sidebar.text_input("MongoDB URI", value="", help="e.g. mongodb://user:pass@host:27017 or mongodb://localhost:27017")
-mongo_db = st.sidebar.text_input("DB name", value="sitecrawler")
-mongo_collection = st.sidebar.text_input("Collection name", value="pages")
+# Batch save settings (incremental persistence)
+st.sidebar.header("Persistence")
+batch_size = st.sidebar.number_input("Save to Mongo every N pages (batch size)", min_value=1, max_value=500, value=20, step=1)
 auto_save_mongo = st.sidebar.checkbox("Auto-save crawl to MongoDB after finishing", value=False)
+
+# Sentiment backend selection
+st.sidebar.header("Sentiment")
+sentiment_backend = st.sidebar.selectbox("Sentiment backend", options=["nltk", "google"], index=0)
+st.sidebar.caption("Google requires GOOGLE_APPLICATION_CREDENTIALS to be set or credentials provided via secrets.")
+
+# NOTE: MongoDB and Google credentials are read from Streamlit secrets (hidden)
+mongo_secrets = st.secrets.get("mongo", {}) if hasattr(st, "secrets") else {}
+mongo_uri = mongo_secrets.get("uri") or os.getenv("MONGO_URI")
+mongo_db = mongo_secrets.get("db", "sitecrawler")
+mongo_collection = mongo_secrets.get("collection", "pages")
+
+google_secrets = st.secrets.get("google", {}) if hasattr(st, "secrets") else {}
+# Optionally allow a JSON key stored in secrets under google.credentials (string)
+google_creds_json = google_secrets.get("credentials")  # optional JSON string
+# If you provide the JSON string, write it to a temp file and set GOOGLE_APPLICATION_CREDENTIALS
+if sentiment_backend == "google" and google_creds_json:
+    creds_path = "/tmp/streamlit_google_creds.json"
+    try:
+        with open(creds_path, "w") as f:
+            f.write(google_creds_json)
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
+    except Exception as e:
+        st.warning(f"Could not write Google credentials to temp file: {e}")
 
 # Initialize session state
 if "pages" not in st.session_state:
@@ -53,14 +74,62 @@ progress_bar = st.progress(0)
 status_text = st.empty()
 log_area = st.empty()
 
+# Load from MongoDB button
+st.sidebar.markdown("---")
+if st.sidebar.button("Load from MongoDB and build index"):
+    if not mongo_uri:
+        st.sidebar.error("Mongo URI not found in secrets or environment (MONGO_URI).")
+    else:
+        with st.spinner("Loading pages from MongoDB..."):
+            try:
+                pages = load_pages_from_mongo(uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, limit=max_pages)
+                st.session_state.pages = pages
+                idx = SearchIndex()
+                idx.build(pages)
+                st.session_state.index = idx
+                st.sidebar.success(f"Loaded {len(pages)} pages and rebuilt in-memory index.")
+            except Exception as e:
+                st.sidebar.error(f"Failed to load from MongoDB: {e}")
+
 if run:
     if not start_url.startswith("http"):
         st.error("Please enter a valid http/https URL.")
     else:
-        st.info("Starting crawl — this will run synchronously in the Streamlit session. For large crawls you may want to run separately.")
+        st.info("Starting crawl — this will run synchronously in the Streamlit session. For large crawls run separately.")
+        # instantiate crawler with chosen sentiment backend
         crawler = Crawler(start_url=start_url, max_pages=int(max_pages), delay=float(delay), same_domain=bool(same_domain),
-                          headers={"User-Agent": user_agent}, timeout=int(timeout))
-        pages = []
+                          headers={"User-Agent": user_agent}, timeout=int(timeout),
+                          sentiment_backend=sentiment_backend)
+
+        # incremental save buffer
+        save_buffer = []
+        total_saved = 0
+        total_updated = 0
+        save_errors = []
+
+        def on_page_callback(page):
+            # Called per page during crawl. Append to session pages and buffer for persistence.
+            st.session_state.pages.append(page)
+            save_buffer.append(page)
+            nonlocal total_saved, total_updated, save_errors
+            if len(save_buffer) >= batch_size:
+                if mongo_uri:
+                    try:
+                        summary = save_pages_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, upsert=True)
+                        total_saved += summary.get("inserted", 0)
+                        total_updated += summary.get("updated", 0)
+                        if summary.get("errors"):
+                            save_errors.extend(summary.get("errors"))
+                            st.warning(f"Batch saved with {len(summary['errors'])} errors (see logs).")
+                    except Exception as e:
+                        save_errors.append({"error": str(e)})
+                        st.error(f"Batch save failed: {e}")
+                else:
+                    # no mongo configured; just skip saving
+                    pass
+                # clear the buffer after attempt
+                save_buffer.clear()
+
         def progress_cb(current, maximum, last_url):
             try:
                 progress = int((current / maximum) * 100)
@@ -70,46 +139,55 @@ if run:
             status_text.markdown(f"Crawled {current}/{maximum}: {last_url}")
             log_area.text(f"Crawled {current}/{maximum}: {last_url}")
 
-        pages = crawler.crawl(progress_callback=progress_cb)
-        st.session_state.pages = pages
-        st.success(f"Finished crawling: {len(pages)} pages collected.")
+        # reset session pages before crawl unless you want to append
+        st.session_state.pages = []
+        try:
+            pages = crawler.crawl(progress_callback=progress_cb, on_page=on_page_callback)
+        except Exception as e:
+            st.error(f"Crawl failed with exception: {e}")
+            pages = st.session_state.pages  # whatever we have so far
+
+        # save any remaining buffer
+        if save_buffer:
+            if mongo_uri:
+                try:
+                    summary = save_pages_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, upsert=True)
+                    total_saved += summary.get("inserted", 0)
+                    total_updated += summary.get("updated", 0)
+                    if summary.get("errors"):
+                        save_errors.extend(summary.get("errors"))
+                except Exception as e:
+                    save_errors.append({"error": str(e)})
+            save_buffer.clear()
+
+        st.session_state.pages = pages or st.session_state.pages
+        st.success(f"Finished crawling: {len(st.session_state.pages)} pages collected.")
         progress_bar.progress(100)
-        # build index
+
+        # build index automatically
         idx = SearchIndex()
-        idx.build(pages)
+        idx.build(st.session_state.pages)
         st.session_state.index = idx
+        st.info("Built in-memory search index (includes headings and image alt tags).")
 
-        # Optionally save to MongoDB automatically
-        if auto_save_mongo and mongo_uri:
-            with st.spinner("Saving pages to MongoDB..."):
-                try:
-                    summary = save_pages_to_mongo(pages, uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, upsert=True)
-                    if summary.get("errors"):
-                        st.warning(f"Completed with errors: {len(summary['errors'])} (first: {summary['errors'][0]})")
-                    st.success(f"Saved to MongoDB — inserted: {summary.get('inserted',0)}, updated: {summary.get('updated',0)}")
-                except Exception as e:
-                    st.error(f"Error saving to MongoDB: {e}")
+        if auto_save_mongo:
+            if not mongo_uri:
+                st.error("Auto-save requested but Mongo secrets not found. Make sure you set Streamlit secrets for mongo.uri or set MONGO_URI.")
+            else:
+                with st.spinner("Saving all pages to MongoDB (final save)..."):
+                    try:
+                        summary = save_pages_to_mongo(st.session_state.pages, uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, upsert=True)
+                        if summary.get("errors"):
+                            st.warning(f"Completed with errors: {len(summary['errors'])} (first: {summary['errors'][0]})")
+                        st.success(f"Saved to MongoDB — inserted: {summary.get('inserted',0)}, updated: {summary.get('updated',0)}")
+                    except Exception as e:
+                        st.error(f"Error saving to MongoDB: {e}")
 
-# Allow manual save to Mongo after crawl
-if st.session_state.pages:
-    st.markdown("### Save crawl results")
-    col_a, col_b = st.columns([3,1])
-    with col_a:
-        st.write("MongoDB destination:")
-        st.write(f"URI: {'(not set)' if not mongo_uri else mongo_uri}")
-        st.write(f"DB: {mongo_db}, Collection: {mongo_collection}")
-    with col_b:
-        if st.button("Save to MongoDB") and mongo_uri:
-            with st.spinner("Saving pages to MongoDB..."):
-                try:
-                    summary = save_pages_to_mongo(st.session_state.pages, uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, upsert=True)
-                    if summary.get("errors"):
-                        st.warning(f"Completed with errors: {len(summary['errors'])} (first: {summary['errors'][0]})")
-                    st.success(f"Saved to MongoDB — inserted: {summary.get('inserted',0)}, updated: {summary.get('updated',0)}")
-                except Exception as e:
-                    st.error(f"Error saving to MongoDB: {e}")
-        elif st.button("Save to MongoDB") and not mongo_uri:
-            st.error("Please enter a MongoDB URI in the sidebar before saving.")
+        # show save summary (from incremental batches)
+        st.write("Incremental save summary during crawl:")
+        st.write(f"Total inserted (batches): {total_saved}, total updated (batches): {total_updated}, batch errors: {len(save_errors)}")
+        if save_errors:
+            st.write(save_errors[:5])
 
 st.markdown("---")
 
@@ -130,21 +208,19 @@ if run_batch:
     else:
         queries = [line.strip() for line in batch_input.splitlines() if line.strip()]
         st.info(f"Running {len(queries)} queries...")
-        all_results = {}
         for q in queries:
-            # If the query contains spaces, treat as phrase search by default, otherwise token
             is_phrase = " " in q.strip()
-            res = st.session_state.index.search(q, fields=["title","meta","text","alt"], phrase=is_phrase, max_results=200)
-            all_results[q] = res
+            res = st.session_state.index.search(q, fields=["title","meta","text","alt","headings"], phrase=is_phrase, max_results=200)
             st.markdown(f"#### Query: `{q}` — {len(res)} result(s)")
             if res:
-                # show top 10 results
-                df = pd.DataFrame(res[:10])
+                df = pd.DataFrame(res[:20])
                 st.dataframe(df)
             else:
                 st.write("No results found.")
 
-# Searching UI (single-query form)
+st.markdown("---")
+
+# Single-query search UI
 st.subheader("Single query search")
 if not st.session_state.pages:
     st.info("No pages indexed yet. Start a crawl to index pages.")
@@ -152,7 +228,7 @@ else:
     with st.form("search_form"):
         q = st.text_input("Search query (word or phrase)")
         phrase = st.checkbox("Treat query as phrase (substring)", value=False)
-        cols = st.multiselect("Fields to search", options=["title","meta","text","alt"], default=["title","meta","text"])
+        cols = st.multiselect("Fields to search", options=["title","meta","text","alt","headings"], default=["title","meta","text"])
         max_results = st.slider("Max results", min_value=10, max_value=1000, value=200, step=10)
         submitted = st.form_submit_button("Search")
     if submitted and q.strip():
@@ -163,42 +239,44 @@ else:
             with st.spinner("Searching..."):
                 results = idx.search(q, fields=cols, phrase=phrase, max_results=max_results)
             st.success(f"Found {len(results)} result rows")
-            # present results
             if results:
                 df = pd.DataFrame(results)
                 st.dataframe(df)
-                # CSV export
                 csv_buf = StringIO()
                 df.to_csv(csv_buf, index=False)
                 st.download_button("Download results CSV", data=csv_buf.getvalue(), file_name="search_results.csv", mime="text/csv")
 
-                # per-page viewer: pick a result
                 st.markdown("### Inspect a result")
                 pick = st.selectbox("Choose a URL", options=[r["url"] for r in results])
                 page = st.session_state.index.pages.get(pick)
                 if page:
-                    st.markdown(f"**Title:** {page.get('title')}")
-                    st.markdown(f"**Meta description:** {page.get('meta')}")
+                    st.markdown(f"**Title:** {page.get('title')} (length: {page.get('title_len')})")
+                    st.markdown(f"**Meta description:** {page.get('meta')} (length: {page.get('meta_len')})")
+                    st.markdown(f"**Main content length:** {page.get('content_len')}")
+                    st.markdown("**Heading counts:**")
+                    hcounts = page.get("h_counts", {})
+                    for k in sorted(hcounts.keys()):
+                        st.write(f"- {k}: {hcounts[k]}")
                     st.markdown("---")
                     st.markdown("**Images (src / alt)**")
                     for img in page.get("images", []):
-                        st.markdown(f"- {img.get('src')} — alt: {img.get('alt')}")
+                        st.write(f"- {img.get('src')} — alt: {img.get('alt')}")
                     st.markdown("---")
-                    # highlight matches in text (simple)
+                    st.markdown("**Sentiment (details)**")
+                    sent = page.get("sentiment", {})
+                    st.write(sent)
+                    st.markdown("---")
                     content = page.get("text", "") or ""
-                    lowq = q.lower()
                     if phrase:
                         highlighted = content.replace(q, f"**{q}**")
                         st.markdown(highlighted[:5000] + ("..." if len(highlighted) > 5000 else ""))
                     else:
-                        # highlight tokens
                         import re
                         tokens = [t.lower() for t in re.findall(r"\w[\w'-]*", q)]
                         display = content
                         for tkn in set(tokens):
                             display = re.sub(f"(?i)({re.escape(tkn)})", r"**\1**", display)
                         st.markdown(display[:5000] + ("..." if len(display) > 5000 else ""))
-
                     st.markdown(f"[Open original page]({page.get('url')})")
             else:
                 st.warning("No matches found.")
