@@ -8,15 +8,14 @@ from bs4 import BeautifulSoup
 from urllib import robotparser
 from collections import deque
 
-# Do NOT run downloads or heavy initialization at import time.
-# We'll lazily initialize NLTK VADER and Google client inside the Crawler instance.
+# Do not perform heavy initialization at import time.
 _SIA = None
 try:
     import nltk
 except Exception:
     nltk = None
 
-# Google Cloud client marker
+# detect google client availability without instantiating credentials
 try:
     from google.cloud import language_v1  # may not be installed
     _HAS_GOOGLE = True
@@ -34,12 +33,22 @@ DEFAULT_HEADERS = {
 
 class Crawler:
     """
-    Robust crawler that lazily initializes sentiment backends to avoid import-time failures.
-    Use sentiment_backend="nltk" or "google".
-    on_page callback will be called per page (useful for incremental save).
+    Crawler that supports sentiment via 'nltk' (VADER) or 'google' (Cloud Natural Language).
+    The google backend will only be used if GOOGLE_APPLICATION_CREDENTIALS is set (or you
+    explicitly set a credentials file prior to instantiation).
     """
-    def __init__(self, start_url, max_pages=2000, delay=0.5, same_domain=True, headers=None, timeout=10,
-                 sentiment_backend="nltk", google_credentials_env_var=None):
+
+    def __init__(
+        self,
+        start_url,
+        max_pages=2000,
+        delay=0.5,
+        same_domain=True,
+        headers=None,
+        timeout=10,
+        sentiment_backend="nltk",
+        google_credentials_env_var=None,
+    ):
         self.start_url = start_url.rstrip("/")
         self.max_pages = int(max_pages)
         self.delay = float(delay)
@@ -56,13 +65,14 @@ class Crawler:
         self.rp = robotparser.RobotFileParser()
         self._init_robots()
 
-        # sentiment backend choice
+        # choose sentiment backend
         self.sentiment_backend = (sentiment_backend or "nltk").lower()
-        # optional credentials env var name or path
+
+        # if caller provides a path via google_credentials_env_var, set it as GOOGLE_APPLICATION_CREDENTIALS
         if google_credentials_env_var:
             os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", google_credentials_env_var)
 
-        # lazy-initialized clients
+        # lazy init
         self._sia = None
         self._google_client = None
 
@@ -99,7 +109,6 @@ class Crawler:
         return urljoin(base, link.split("#")[0])
 
     def _ensure_nltk(self):
-        # Lazily initialize the NLTK VADER analyzer if available
         global _SIA
         if _SIA is not None:
             self._sia = _SIA
@@ -109,21 +118,38 @@ class Crawler:
             return
         try:
             from nltk.sentiment import SentimentIntensityAnalyzer
-            # Do NOT call nltk.download here in production; assume the env already has the data.
-            # If the lexicon is missing, initialize will raise; catch and fallback to None.
+
+            # assume data is preinstalled in environment; do NOT call nltk.download here
             self._sia = SentimentIntensityAnalyzer()
             _SIA = self._sia
         except Exception:
-            # fallback: leave _sia as None
             self._sia = None
 
     def _ensure_google_client(self):
+        """
+        Lazily create a google language client but ONLY if explicit credentials are available.
+        We avoid attempting the metadata server by refusing to instantiate the client when
+        GOOGLE_APPLICATION_CREDENTIALS isn't set. This prevents metadata timeouts on non-GCE hosts.
+        """
         if not _HAS_GOOGLE:
-            raise RuntimeError("google-cloud-language is not installed")
+            raise RuntimeError("google-cloud-language is not installed in the environment.")
+        # Require explicit credentials file env var to avoid metadata lookup
+        creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        if not creds_path:
+            # do not attempt ADC/metadata; raise clear error
+            raise RuntimeError(
+                "Google NLP requested but GOOGLE_APPLICATION_CREDENTIALS is not set. "
+                "Set the env var to a service-account JSON key path or provide credentials via streamlit secrets."
+            )
         if self._google_client is None:
-            # lazily create client (uses GOOGLE_APPLICATION_CREDENTIALS env var)
-            from google.cloud import language_v1
-            self._google_client = language_v1.LanguageServiceClient()
+            try:
+                from google.cloud import language_v1
+
+                self._google_client = language_v1.LanguageServiceClient()
+            except Exception as e:
+                # surface a helpful message and re-raise
+                logger.exception("Failed to instantiate Google Language client: %s", e)
+                raise
         return self._google_client
 
     def _analyze_sentiment_nltk(self, text: str):
@@ -144,12 +170,16 @@ class Crawler:
         try:
             client = self._ensure_google_client()
             from google.cloud import language_v1
+
             document = language_v1.Document(content=text, type_=language_v1.Document.Type.PLAIN_TEXT)
-            response = client.analyze_sentiment(request={'document': document, 'encoding_type': language_v1.EncodingType.UTF8})
+            response = client.analyze_sentiment(
+                request={"document": document, "encoding_type": language_v1.EncodingType.UTF8}
+            )
             score = response.document_sentiment.score
             magnitude = response.document_sentiment.magnitude
             return {"score": float(score), "magnitude": float(magnitude), "compound": float(score), "backend": "google"}
         except Exception as e:
+            # Do not propagate metadata/refresh errors upstream; return safe fallback with error note
             logger.exception("Google NLP sentiment failed: %s", e)
             return {"score": 0.0, "magnitude": 0.0, "compound": 0.0, "backend": "google", "error": str(e)}
 
@@ -168,6 +198,7 @@ class Crawler:
         if desc_tag and desc_tag.get("content"):
             meta_desc = desc_tag["content"].strip()
 
+        # remove script/style
         for script in soup(["script", "style", "noscript"]):
             script.decompose()
         text = soup.get_text(separator=" ", strip=True)
@@ -179,6 +210,7 @@ class Crawler:
             src = urljoin(url, src)
             images.append({"src": src, "alt": alt})
 
+        # headings
         h_counts = {}
         headings_text_parts = []
         for i in range(1, 7):
