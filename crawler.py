@@ -2,7 +2,6 @@ import requests
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
-from collections import deque
 import time
 
 from utils import normalize_url, is_same_domain, extract_text, hash_text
@@ -13,29 +12,27 @@ DEFAULT_HEADERS = {
 
 def crawl_site(start_url, max_workers=10, max_pages=1000, timeout=10):
     """
-    Crawl pages within the same domain (start_url). Return dict:
+    Crawl pages within the same domain starting from start_url. Returns a dict:
     {
       "pages": {url: page_data, ...},
       "links": {from_url: [to_url,...], ...},
       "start_url": start_url,
       "timestamp": iso8601...
     }
-    page_data:
-      {
-        url, status_code, headers, title, meta_description, canonical,
-        h_tags: {"h1": [...], "h2": [...]}, images: [{"src":..., "alt":...}], content_text, content_hash, response_time
-      }
+
+    This implementation uses a ThreadPoolExecutor and submits new tasks as pages complete,
+    so it will discover and crawl same-domain links until max_pages is reached.
     """
+    start_url = normalize_url(start_url, start_url)  # ensure normalized
     parsed = urlparse(start_url)
     base_netloc = parsed.netloc
 
     session = requests.Session()
     session.headers.update(DEFAULT_HEADERS)
 
-    seen = set()
-    pages = {}
-    links = {}
-    q = deque([normalize_url(start_url, start_url)])
+    pages = {}   # url -> page data
+    links = {}   # url -> [outs]
+    seen = set() # URLs already submitted/fetched
     start_time = time.time()
 
     def fetch(url):
@@ -50,13 +47,12 @@ def crawl_site(start_url, max_workers=10, max_pages=1000, timeout=10):
             title_tag = soup.title.string.strip() if soup.title and soup.title.string else ""
             meta_desc = ""
             canonical = ""
+            # meta description & canonical
             for m in soup.find_all("meta"):
                 nm = (m.get("name") or "").lower()
                 prop = (m.get("property") or "").lower()
                 if nm == "description" or prop == "og:description":
-                    meta_desc = m.get("content", "") or meta_desc
-                if (m.get("rel") and "canonical" in m.get("rel")) or m.get("property") == "canonical":
-                    canonical = m.get("href") or canonical
+                    meta_desc = meta_desc or m.get("content", "") or ""
             link_tag = soup.find("link", rel="canonical")
             if link_tag and link_tag.get("href"):
                 canonical = link_tag.get("href")
@@ -69,14 +65,14 @@ def crawl_site(start_url, max_workers=10, max_pages=1000, timeout=10):
             images = []
             for img in soup.find_all("img"):
                 images.append({"src": normalize_url(url, img.get("src")), "alt": (img.get("alt") or "").strip()})
-            # out links
+            # out links (normalize and remove fragments)
             out_links = []
             for a in soup.find_all("a", href=True):
                 out = normalize_url(url, a.get("href"))
                 if out:
                     out_links.append(out)
             content_text = extract_text(soup)
-            content_hash = hash_text(content_text)
+            content_hash = hash_text(content_text) if content_text else ""
             return {
                 "url": url,
                 "status_code": status,
@@ -92,34 +88,69 @@ def crawl_site(start_url, max_workers=10, max_pages=1000, timeout=10):
                 "response_time": rt,
             }
         except Exception as e:
-            return {"url": url, "status_code": None, "error": str(e), "out_links": [], "images": [], "h_tags": {}, "title": "", "meta_description": "", "canonical": "", "content_text": "", "content_hash": "", "response_time": 0.0}
+            return {
+                "url": url,
+                "status_code": None,
+                "error": str(e),
+                "headers": {},
+                "title": "",
+                "meta_description": "",
+                "canonical": "",
+                "h_tags": {},
+                "images": [],
+                "out_links": [],
+                "content_text": "",
+                "content_hash": "",
+                "response_time": 0.0
+            }
 
+    # Start crawling: submit the start_url first
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {}
-        while q and len(seen) < max_pages:
-            url = q.popleft()
-            if url in seen:
-                continue
-            seen.add(url)
-            futures[executor.submit(fetch, url)] = url
+        futures = {}  # future -> url
+        # normalize and submit start_url
+        seen.add(start_url)
+        futures[executor.submit(fetch, start_url)] = start_url
 
-            # collect completed ones to push new links & maintain queue size
-            done_futures = [f for f in futures if f.done()]
-            for f in done_futures:
-                url_origin = futures.pop(f)
+        # Process futures as they complete; when we see new same-domain links, submit them
+        while futures and len(pages) < max_pages:
+            # as_completed yields futures as they finish
+            for f in as_completed(list(futures.keys())):
+                origin = futures.pop(f)
                 page = f.result()
-                pages[url_origin] = page
-                links[url_origin] = []
+                pages[origin] = page
+                links[origin] = page.get("out_links", [])
+
+                # Submit discovered same-domain links
                 for out in page.get("out_links", []):
-                    links[url_origin].append(out)
-                    if is_same_domain(base_netloc, out) and out not in seen and out not in q and len(seen) + len(q) < max_pages:
-                        q.append(out)
-        # wait for remaining futures
+                    if not out:
+                        continue
+                    # only follow same domain
+                    if not is_same_domain(base_netloc, out):
+                        continue
+                    norm = normalize_url(out, out)
+                    if not norm:
+                        continue
+                    if norm in seen:
+                        continue
+                    # if we're at capacity, stop adding more
+                    if len(seen) >= max_pages:
+                        break
+                    seen.add(norm)
+                    # submit new fetch task
+                    futures[executor.submit(fetch, norm)] = norm
+
+                # Stop early if we've reached the page limit
+                if len(pages) >= max_pages:
+                    break
+
+        # In case any remaining futures completed after loop, ensure we store them (but do not add new links)
         for f in as_completed(list(futures.keys())):
-            url_origin = futures[f]
+            origin = futures.pop(f)
+            if origin in pages:
+                continue
             page = f.result()
-            pages[url_origin] = page
-            links[url_origin] = page.get("out_links", [])
+            pages[origin] = page
+            links[origin] = page.get("out_links", [])
 
     result = {
         "pages": pages,
