@@ -13,6 +13,11 @@ try:
     from search_index import SearchIndex
     from db import save_pages_to_mongo, load_pages_from_mongo
 
+    # threading and queue for background crawl + UI polling
+    import threading
+    import queue
+    import time
+
     # --- Helper: get secrets ---
     mongo_secrets = st.secrets.get("mongo", {}) if hasattr(st, "secrets") else {}
     mongo_uri = mongo_secrets.get("uri") or os.getenv("MONGO_URI")
@@ -30,7 +35,6 @@ try:
                 f.write(google_creds_json)
             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
         except Exception:
-            # don't call st.* here (we're still in setup); we'll show a warning later if needed
             pass
 
     # --- UI layout and state initialization ---
@@ -40,7 +44,7 @@ try:
     # Sidebar: Crawl settings
     st.sidebar.header("Crawl settings")
     start_url = st.sidebar.text_input("Start URL (including http:// or https://)", value="https://example.com")
-    max_pages = st.sidebar.number_input("Max pages to crawl", min_value=1, max_value=2000, value=500, step=50)
+    max_pages = st.sidebar.number_input("Max pages to crawl", min_value=1, max_value=2000, value=50, step=10)
     delay = st.sidebar.slider("Delay between requests (seconds)", min_value=0.0, max_value=5.0, value=0.5, step=0.1)
     same_domain = st.sidebar.checkbox("Restrict to same domain", True)
     st.sidebar.markdown("Advanced")
@@ -67,7 +71,7 @@ try:
     col1, col2 = st.columns([2, 1])
     with col1:
         start_crawl = st.button("Start crawl")
-        # note: stop button is still a placeholder in this synchronous version
+        # note: stop button is still a placeholder in this version
         stop_crawl = st.button("Stop (not implemented)")
     with col2:
         st.write("Index status")
@@ -97,13 +101,19 @@ try:
                 except Exception as e:
                     st.sidebar.error(f"Failed to load from MongoDB: {e}")
 
-    # Crawl logic
+    # Crawl logic: run crawler in background thread and poll queue for updates (so UI updates in real time)
     if start_crawl:
         # Validate start_url
         if not start_url or not start_url.startswith("http"):
             st.error("Please enter a valid http/https Start URL.")
         else:
-            st.info("Starting crawl — this runs synchronously in the Streamlit session.")
+            st.info("Starting crawl — runs in a background thread; UI will update as pages are processed.")
+
+            # Thread-safe queue for progress messages coming from the crawler thread
+            q = queue.Queue()
+            crawl_thread_exception = {"exc": None}
+
+            # instantiate crawler
             crawler = Crawler(
                 start_url=start_url,
                 max_pages=int(max_pages),
@@ -114,73 +124,111 @@ try:
                 sentiment_backend=sentiment_backend,
             )
 
-            # incremental save buffer and stats (mutated by callback)
-            save_buffer = []
-            stats = {"inserted": 0, "updated": 0, "errors": []}
+            # on_page callback used by crawler thread -> queue
+            def on_page_threadsafe(page):
+                # Put page into queue (background thread only writes to queue)
+                q.put({"type": "page", "page": page})
 
-            # on_page callback MUST NOT call streamlit UI functions directly (avoid ScriptRunContext warnings)
-            def on_page_callback(page):
-                # Append page to session_state list and to save buffer
-                st.session_state.pages.append(page)
-                save_buffer.append(page)
-
-                # Only mutate save_buffer and stats here (no st.* calls)
-                if len(save_buffer) >= int(batch_size):
-                    if mongo_uri:
-                        try:
-                            summary = save_pages_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, upsert=True)
-                            stats["inserted"] += summary.get("inserted", 0)
-                            stats["updated"] += summary.get("updated", 0)
-                            if summary.get("errors"):
-                                stats["errors"].extend(summary.get("errors"))
-                        except Exception as e:
-                            stats["errors"].append({"error": str(e)})
-                    # clear buffer regardless to avoid infinite growth
-                    save_buffer.clear()
-
-            def progress_cb(current, maximum, last_url):
+            # finalization marker
+            def crawl_worker():
                 try:
-                    progress = int((current / maximum) * 100)
-                except Exception:
-                    progress = 0
-                progress_bar.progress(min(progress, 100))
-                status_text.markdown(f"Crawled {current}/{maximum}: {last_url}")
-                log_area.text(f"Crawled {current}/{maximum}: {last_url}")
+                    crawler.crawl(progress_callback=None, on_page=on_page_threadsafe)
+                    q.put({"type": "done"})
+                except Exception as e:
+                    # push error to queue so main thread can display it
+                    q.put({"type": "error", "error": str(e)})
+                    crawl_thread_exception["exc"] = e
+                    q.put({"type": "done"})
 
-            # reset session pages before crawl (unless you intentionally want to append)
+            # Start background thread
+            t = threading.Thread(target=crawl_worker, daemon=True)
+            # Reset pages in session state (we'll append as results come in)
             st.session_state.pages = []
-            try:
-                pages = crawler.crawl(progress_callback=progress_cb, on_page=on_page_callback)
-            except Exception as e:
-                st.error(f"Crawl failed with exception: {e}")
-                # still attempt to use whatever was appended
-                pages = st.session_state.pages
+            t.start()
 
-            # flush remaining buffer
+            # Poll the queue and update UI until thread finishes (or queue empties)
+            inserted_total = 0
+            updated_total = 0
+            save_errors = []
+
+            # Buffer for incremental save (only main thread performs Mongo writes)
+            save_buffer = []
+
+            # Poll loop: continue while thread is alive or there are messages in the queue
+            while t.is_alive() or not q.empty():
+                # Drain queue
+                while not q.empty():
+                    try:
+                        item = q.get_nowait()
+                    except queue.Empty:
+                        break
+                    if item["type"] == "page":
+                        page = item["page"]
+                        # Append to in-memory pages (main thread)
+                        st.session_state.pages.append(page)
+
+                        # update progress bar and status
+                        current = len(st.session_state.pages)
+                        try:
+                            percent = int((current / float(max_pages)) * 100)
+                        except Exception:
+                            percent = 0
+                        progress_bar.progress(min(percent, 100))
+                        status_text.markdown(f"Crawled {current}/{max_pages}: {page.get('url')}")
+                        log_area.text(f"Last: {page.get('url')} — total pages: {current}")
+
+                        # Add to local save buffer and persist in batches (main thread does DB writes)
+                        save_buffer.append(page)
+                        if len(save_buffer) >= int(batch_size):
+                            if mongo_uri:
+                                try:
+                                    summary = save_pages_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, upsert=True)
+                                    inserted_total += summary.get("inserted", 0)
+                                    updated_total += summary.get("updated", 0)
+                                    if summary.get("errors"):
+                                        save_errors.extend(summary.get("errors"))
+                                except Exception as e:
+                                    save_errors.append({"error": str(e)})
+                            save_buffer.clear()
+
+                    elif item["type"] == "error":
+                        st.error(f"Crawl thread error: {item.get('error')}")
+                    elif item["type"] == "done":
+                        # thread finished; continue draining queue then break
+                        pass
+
+                # sleep briefly to yield control so UI updates are sent to browser
+                time.sleep(0.2)
+                # allow Streamlit to process and render updated widgets
+                # (no st.experimental_rerun here; we just loop and update widgets)
+                # If user navigates away or the script re-runs for other reasons, this loop may end.
+
+            # After thread completes, flush any remaining buffer
             if save_buffer:
                 if mongo_uri:
                     try:
                         summary = save_pages_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, upsert=True)
-                        stats["inserted"] += summary.get("inserted", 0)
-                        stats["updated"] += summary.get("updated", 0)
+                        inserted_total += summary.get("inserted", 0)
+                        updated_total += summary.get("updated", 0)
                         if summary.get("errors"):
-                            stats["errors"].extend(summary.get("errors"))
+                            save_errors.extend(summary.get("errors"))
                     except Exception as e:
-                        stats["errors"].append({"error": str(e)})
+                        save_errors.append({"error": str(e)})
                 save_buffer.clear()
 
-            # ensure session_state.pages is set
-            st.session_state.pages = pages or st.session_state.pages
-            st.success(f"Finished crawling: {len(st.session_state.pages)} pages collected.")
-            progress_bar.progress(100)
-
-            # build index from pages (pages already include analysis fields)
+            # Build index from collected pages
             idx = SearchIndex()
             idx.build(st.session_state.pages)
             st.session_state.index = idx
-            st.info("Built in-memory search index (includes headings and image alt tags).")
 
-            # optional final save of all pages
+            progress_bar.progress(100)
+            st.success(f"Finished crawling: {len(st.session_state.pages)} pages collected.")
+            st.write("Incremental save summary during crawl:")
+            st.write(f"Total inserted (batches): {inserted_total}, total updated (batches): {updated_total}, batch errors: {len(save_errors)}")
+            if save_errors:
+                st.write(save_errors[:10])
+
+            # Optional final full save
             if auto_save_mongo:
                 if not mongo_uri:
                     st.error("Auto-save requested but Mongo secrets not found. Set st.secrets['mongo']['uri'] or MONGO_URI.")
@@ -193,12 +241,6 @@ try:
                             st.success(f"Saved to MongoDB — inserted: {summary.get('inserted',0)}, updated: {summary.get('updated',0)}")
                         except Exception as e:
                             st.error(f"Error saving to MongoDB: {e}")
-
-            # show incremental save stats (from callback)
-            st.write("Incremental save summary during crawl:")
-            st.write(f"Total inserted (batches): {stats['inserted']}, total updated (batches): {stats['updated']}, batch errors: {len(stats['errors'])}")
-            if stats["errors"]:
-                st.write(stats["errors"][:10])
 
     # --- Batch queries textbox (main UI) ---
     st.markdown("---")
@@ -284,8 +326,6 @@ try:
                                 display = re.sub(f"(?i)({re.escape(tkn)})", r"**\1**", display)
                             st.markdown(display[:5000] + ("..." if len(display) > 5000 else ""))
                         st.markdown(f"[Open original page]({page.get('url')})")
-                else:
-                    st.warning("No matches found.")
 
 except Exception:
     tb = traceback.format_exc()
@@ -293,5 +333,4 @@ except Exception:
         st.error("An exception occurred during app startup. See traceback below:")
         st.text(tb)
     except Exception:
-        # If Streamlit UI calls fail, print to stderr (check logs)
         print("Exception during app startup:\n", tb, file=sys.stderr)
