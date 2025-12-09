@@ -11,6 +11,7 @@ DEFAULT_HEADERS = {
     "User-Agent": "SeoCrawler/1.0 (+https://github.com/yourname)"
 }
 
+
 class CrawlManager:
     """
     Manages a crawl in a background thread. Supports start, pause, resume, stop.
@@ -107,7 +108,7 @@ class CrawlManager:
                 canonical = link_tag.get("href")
             # headings
             h_tags = {}
-            for i in range(1,7):
+            for i in range(1, 7):
                 tag = f"h{i}"
                 h_tags[tag] = [t.get_text(strip=True) for t in soup.find_all(tag)]
             # images
@@ -120,5 +121,162 @@ class CrawlManager:
                 out = normalize_url(url, a.get("href"))
                 if out:
                     out_links.append(out)
-           
-
+            content_text = extract_text(soup)
+            content_hash = hash_text(content_text) if content_text else ""
+            return {
+                "url": url,
+                "status_code": status,
+                "headers": dict(r.headers),
+                "title": title_tag,
+                "meta_description": meta_desc,
+                "canonical": canonical,
+                "h_tags": h_tags,
+                "images": images,
+                "out_links": out_links,
+                "content_text": content_text,
+                "content_hash": content_hash,
+                "response_time": rt,
+            }
+        except Exception as e:
+            return {
+                "url": url,
+                "status_code": None,
+                "error": str(e),
+                "headers": {},
+                "title": "",
+                "meta_description": "",
+                "canonical": "",
+                "h_tags": {},
+                "images": [],
+                "out_links": [],
+                "content_text": "",
+                "content_hash": "",
+                "response_time": 0.0
+            }
+
+    def _run(self):
+        """
+        Background crawl runner. Uses ThreadPoolExecutor and submits discovered same-domain links.
+        Honors pause and stop events.
+        """
+        session = requests.Session()
+        session.headers.update(DEFAULT_HEADERS)
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {}  # future -> url
+
+            # submit start url
+            start = self.start_url
+            if not start:
+                self.error = "Invalid start URL"
+                self.finished = True
+                return
+            with self._lock:
+                self.seen.add(start)
+                self.discovered = 1
+            futures[executor.submit(self._fetch, session, start)] = start
+
+            try:
+                while futures and not self._stop_event.is_set():
+                    # Pause handling
+                    if self._pause_event.is_set():
+                        # Sleep in short increments while paused, allowing stop to be noticed
+                        while self._pause_event.is_set() and not self._stop_event.is_set():
+                            time.sleep(0.2)
+                        if self._stop_event.is_set():
+                            break
+
+                    # Collect completed futures as they finish
+                    done_any = False
+                    for f in as_completed(list(futures.keys()), timeout=1):
+                        done_any = True
+                        origin = futures.pop(f)
+                        page = f.result()
+
+                        with self._lock:
+                            if origin not in self.pages:
+                                self.pages[origin] = page
+                                self.links[origin] = page.get("out_links", [])
+                                self.pages_crawled += 1
+
+                        # If stop requested, break out
+                        if self._stop_event.is_set():
+                            break
+
+                        # submit discovered same-domain links
+                        for out in page.get("out_links", []):
+                            if not out:
+                                continue
+                            if not is_same_domain(self.base_netloc, out):
+                                continue
+                            norm = normalize_url(out, out)
+                            if not norm:
+                                continue
+                            with self._lock:
+                                if norm in self.seen or len(self.seen) >= self.max_pages:
+                                    continue
+                                self.seen.add(norm)
+                                self.discovered = len(self.seen)
+                            # submit
+                            futures[executor.submit(self._fetch, session, norm)] = norm
+
+                        # Stop if we've crawled enough pages
+                        if self.pages_crawled >= self.max_pages:
+                            self._stop_event.set()
+                            break
+
+                    # If as_completed timed out without any done futures, check loop conditions
+                    if not done_any:
+                        # no futures completed within timeout; if there are still futures, continue and check pause/stop
+                        if self._stop_event.is_set():
+                            break
+                        # small sleep - allow event changes
+                        time.sleep(0.1)
+
+                    # Stop condition - no more futures (all tasks done)
+                    if not futures:
+                        break
+
+                # If stop_event set, try to cancel outstanding futures (best effort)
+                if self._stop_event.is_set():
+                    for f in list(futures.keys()):
+                        f.cancel()
+
+                # Save result snapshot
+                with self._lock:
+                    self.result = {
+                        "pages": dict(self.pages),
+                        "links": dict(self.links),
+                        "start_url": self.start_url,
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time())),
+                    }
+                    self.finished = True
+            except Exception as e:
+                self.error = str(e)
+                self.finished = True
+                # Save partial results if any
+                with self._lock:
+                    self.result = {
+                        "pages": dict(self.pages),
+                        "links": dict(self.links),
+                        "start_url": self.start_url,
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time())),
+                        "error": self.error
+                    }
+
+
+def crawl_site(start_url, max_workers=10, max_pages=1000, timeout=10):
+    """
+    Backwards-compatible synchronous crawl function.
+
+    Many parts of the app (or older code) import crawl_site directly. The new crawler
+    primarily exposes CrawlManager for background crawling, but this helper lets you
+    run a blocking/synchronous crawl that returns the final crawl snapshot (same shape
+    as CrawlManager.result).
+
+    Usage: crawl = crawl_site("https://example.com", max_workers=8, max_pages=500)
+    """
+    mgr = CrawlManager(start_url, max_workers=max_workers, max_pages=max_pages, timeout=timeout)
+    # call the runner synchronously (blocking) so callers expecting a return value get the result
+    mgr._run()
+    return mgr.get_result()
