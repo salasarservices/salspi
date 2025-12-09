@@ -26,6 +26,9 @@ def save_pages_to_mongo(pages: List[Dict[str, Any]],
                         db_name: str = "sitecrawler",
                         collection_name: str = "pages",
                         upsert: bool = True) -> Dict[str, Any]:
+    """
+    Save page documents into collection_name. Uses 'url' as the unique key.
+    """
     summary = {"inserted": 0, "updated": 0, "errors": []}
     client = None
     try:
@@ -55,6 +58,70 @@ def save_pages_to_mongo(pages: List[Dict[str, Any]],
                     summary["inserted"] += 1
             except Exception as e:
                 logger.exception("Error saving document for url=%s: %s", p.get("url"), e)
+                summary["errors"].append({"url": p.get("url"), "error": str(e)})
+    except PyMongoError as e:
+        logger.exception("MongoDB connection or operation failed: %s", e)
+        summary["errors"].insert(0, {"connection_error": str(e)})
+    except ValueError as e:
+        logger.error("Configuration error: %s", e)
+        summary["errors"].insert(0, {"configuration_error": str(e)})
+    finally:
+        if client:
+            client.close()
+    return summary
+
+def save_ocr_to_mongo(pages: List[Dict[str, Any]],
+                      uri: Optional[str] = None,
+                      db_name: str = "sitecrawler",
+                      collection_name: str = "ocr-data",
+                      upsert: bool = True) -> Dict[str, Any]:
+    """
+    Save OCR results (per-page aggregated and per-image details) into a separate collection.
+    Documents have shape:
+      { "url": "...", "ocr_text": "...", "images": [ { "src": "...", "ocr_text": "...", "alt": "...", "ocr_error": "..." }, ... ] }
+    """
+    summary = {"inserted": 0, "updated": 0, "errors": []}
+    client = None
+    try:
+        client = get_mongo_client(uri)
+        client.admin.command("ping")
+        db = client[db_name]
+        coll = db[collection_name]
+        try:
+            coll.create_index("url", unique=True)
+        except Exception as e:
+            logger.debug("Could not create index on url in ocr collection: %s", e)
+
+        for p in pages:
+            try:
+                url = p.get("url")
+                doc = {
+                    "url": url,
+                    "ocr_text": p.get("ocr_text", "") or "",
+                    "images": []
+                }
+                # p.get("ocr_details") expected to be list of image dicts
+                for img in p.get("ocr_details", []):
+                    doc["images"].append({
+                        "src": img.get("src"),
+                        "alt": img.get("alt"),
+                        "ocr_text": img.get("ocr_text", "") or "",
+                        "ocr_error": img.get("ocr_error")
+                    })
+                if upsert:
+                    res = coll.replace_one({"url": url}, doc, upsert=True)
+                    if getattr(res, "matched_count", 0) > 0:
+                        summary["updated"] += 1
+                    else:
+                        if getattr(res, "upserted_id", None) is not None:
+                            summary["inserted"] += 1
+                        else:
+                            summary["inserted"] += 1
+                else:
+                    coll.insert_one(doc)
+                    summary["inserted"] += 1
+            except Exception as e:
+                logger.exception("Error saving OCR for url=%s: %s", p.get("url"), e)
                 summary["errors"].append({"url": p.get("url"), "error": str(e)})
     except PyMongoError as e:
         logger.exception("MongoDB connection or operation failed: %s", e)
