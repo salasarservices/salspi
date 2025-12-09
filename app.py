@@ -29,6 +29,34 @@ try:
     BATCH_SAVE_SIZE = 50
     DEFAULT_SEARCH_FIELDS = ["title", "meta", "text", "alt", "headings", "ocr"]
 
+    # --- Helpers ---
+    def safe_rerun():
+        """
+        Call Streamlit's experimental rerun if available; otherwise no-op.
+        Some Streamlit builds may not expose experimental_rerun, so we guard it.
+        """
+        try:
+            rerun = getattr(st, "experimental_rerun", None)
+            if callable(rerun):
+                rerun()
+        except Exception:
+            # best-effort only
+            pass
+
+    def eta_text(start_ts, processed, total):
+        if processed <= 0:
+            return "ETA: calculating..."
+        elapsed = time.time() - start_ts
+        per_page = elapsed / processed
+        remaining = max(0, total - processed)
+        eta_secs = per_page * remaining
+        if eta_secs < 60:
+            return f"ETA: {int(eta_secs)}s"
+        else:
+            mins = int(eta_secs // 60)
+            secs = int(eta_secs % 60)
+            return f"ETA: {mins}m {secs}s"
+
     # --- Secrets and credentials detection ---
     mongo_secrets = st.secrets.get("mongo", {}) if hasattr(st, "secrets") else {}
     mongo_uri = mongo_secrets.get("uri") or os.getenv("MONGO_URI")
@@ -152,7 +180,8 @@ try:
                 del st.session_state[k]
             except Exception:
                 pass
-        st.experimental_rerun()
+        # best-effort rerun (may be no-op in some Streamlit builds)
+        safe_rerun()
 
     # --- Main controls ---
     col1, col2 = st.columns([2, 1])
@@ -185,21 +214,6 @@ try:
     status_text = st.empty()
     log_area = st.empty()
     running_info = st.empty()
-
-    # --- Helper functions ---
-    def eta_text(start_ts, processed, total):
-        if processed <= 0:
-            return "ETA: calculating..."
-        elapsed = time.time() - start_ts
-        per_page = elapsed / processed
-        remaining = max(0, total - processed)
-        eta_secs = per_page * remaining
-        if eta_secs < 60:
-            return f"ETA: {int(eta_secs)}s"
-        else:
-            mins = int(eta_secs // 60)
-            secs = int(eta_secs % 60)
-            return f"ETA: {mins}m {secs}s"
 
     # Worker starter: create queue and thread in session_state
     def start_crawl_background():
@@ -255,8 +269,7 @@ try:
             else:
                 start_crawl_background()
                 st.info(f"Starting crawl — runs in background; indexing up to {MAX_PAGES} pages.")
-                # immediately rerun to let the queue-drain loop run in the fresh session
-                st.experimental_rerun()
+                # no explicit rerun required; the queue-drain logic below will run in this execution
 
     # --- Queue draining & UI update loop (main thread only) ---
     q = st.session_state.get("crawl_queue")
@@ -327,11 +340,12 @@ try:
                 # mark done; will handle finalization after loop
                 pass
 
-        # If the worker thread is still alive, request a short rerun so we continue draining queue and updating UI.
+        # If the worker thread is still alive, sleep a bit here and continue draining (keeps UI responsive)
         if st.session_state.crawl_thread is not None and st.session_state.crawl_thread.is_alive():
-            # brief sleep to avoid tight loop; then rerun so Streamlit pushes updates to browser
+            # brief sleep to avoid tight loop; then continue (no rerun required)
             time.sleep(0.12)
-            st.experimental_rerun()
+            # Re-run the same script context (no-op if experimental_rerun unavailable)
+            safe_rerun()
         else:
             # worker finished; flush remaining buffer and finalize
             if save_buffer:
@@ -344,6 +358,7 @@ try:
                             stats["errors"].extend(summary.get("errors"))
                     except Exception as e:
                         stats["errors"].append({"error": str(e)})
+                    # OCR save for remaining buffer
                     try:
                         ocr_summary = save_ocr_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name="ocr-data", upsert=True)
                         stats["ocr_inserted"] += ocr_summary.get("inserted", 0)
