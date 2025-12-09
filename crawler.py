@@ -13,11 +13,13 @@ try:
     from PIL import Image
     from io import BytesIO
     import pytesseract
+    import warnings
     _HAS_OCR = True
 except Exception:
     Image = None
     BytesIO = None
     pytesseract = None
+    warnings = None
     _HAS_OCR = False
 
 # Do not perform heavy initialization at import time.
@@ -202,7 +204,7 @@ class Crawler:
         try:
             # small safety: do not download extremely large images
             resp = requests.get(img_url, headers=self.headers, timeout=self.timeout, stream=True)
-            content_type = resp.headers.get("Content-Type", "")
+            content_type = resp.headers.get("Content-Type", "") or ""
             if resp.status_code != 200 or not content_type.startswith("image"):
                 return {"ocr_text": "", "error": f"non-image or status {resp.status_code}"}
             # limit read to e.g. 5MB
@@ -210,18 +212,54 @@ class Crawler:
             content = resp.raw.read(max_bytes + 1)
             if len(content) > max_bytes:
                 return {"ocr_text": "", "error": "image-too-large"}
-            img = Image.open(BytesIO(content)).convert("RGB")
+
+            # Use BytesIO and PIL open. Handle palette/transparency by explicit conversion.
+            try:
+                img = Image.open(BytesIO(content))
+            except Exception as e:
+                logger.debug("PIL failed to open image %s: %s", img_url, e)
+                return {"ocr_text": "", "error": f"pil-open-failed: {e}"}
+
+            # Convert palette images (mode 'P') to RGBA first to avoid PIL warning,
+            # then convert to RGB for OCR (pytesseract expects RGB).
+            try:
+                if img.mode == "P":
+                    # avoid warning: convert to RGBA then to RGB
+                    try:
+                        img = img.convert("RGBA")
+                    except Exception:
+                        # fallback: convert directly to RGB
+                        img = img.convert("RGB")
+                elif img.mode in ("LA", "L", "RGBA", "CMYK", "P"):
+                    # normalize common modes to RGB
+                    try:
+                        img = img.convert("RGB")
+                    except Exception:
+                        pass
+            except Exception:
+                # if conversion fails, continue with original img
+                pass
+
             # optionally pre-process: resize if huge
-            w, h = img.size
-            max_dim = 2500
-            if max(w, h) > max_dim:
-                ratio = max_dim / float(max(w, h))
-                new_size = (int(w * ratio), int(h * ratio))
-                img = img.resize(new_size)
-            text = pytesseract.image_to_string(img)
-            return {"ocr_text": text.strip(), "error": None}
+            try:
+                w, h = img.size
+                max_dim = 2500
+                if max(w, h) > max_dim:
+                    ratio = max_dim / float(max(w, h))
+                    new_size = (int(w * ratio), int(h * ratio))
+                    img = img.resize(new_size)
+            except Exception:
+                pass
+
+            # run OCR
+            try:
+                text = pytesseract.image_to_string(img)
+                return {"ocr_text": text.strip(), "error": None}
+            except Exception as e:
+                logger.debug("pytesseract failed on %s: %s", img_url, e)
+                return {"ocr_text": "", "error": f"ocr-failed: {e}"}
         except Exception as e:
-            logger.debug("OCR failed for %s: %s", img_url, e)
+            logger.exception("OCR failed for %s: %s", img_url, e)
             return {"ocr_text": "", "error": str(e)}
 
     def _extract(self, html, url):
@@ -323,7 +361,7 @@ class Crawler:
 
             try:
                 resp = requests.get(url, headers=self.headers, timeout=self.timeout)
-                content_type = resp.headers.get("Content-Type", "")
+                content_type = resp.headers.get("Content-Type", "") or ""
                 if resp.status_code != 200 or "html" not in content_type:
                     logger.debug("Skipping non-HTML or non-200: %s (%s)", url, resp.status_code)
                     self.visited.add(url)
