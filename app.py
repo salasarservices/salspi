@@ -1,218 +1,131 @@
 import streamlit as st
-import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
 import pandas as pd
+from crawler import Crawler
+from search_index import SearchIndex
 import time
-import re
-from collections import deque
+import csv
+from io import StringIO
 
-# --- CONFIGURATION ---
-MAX_PAGES_DEFAULT = 50
-USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+st.set_page_config(page_title="Website Crawler & Search", layout="wide")
 
-# --- HELPER FUNCTIONS ---
+st.title("Website Crawler & Search")
+st.markdown("Crawl a site (limited pages) and search words/phrases in titles, descriptions, body text and image alt tags.")
 
-def is_valid_url(url, base_domain):
-    """
-    Checks if a URL is valid and belongs to the same domain to prevent external crawling.
-    """
-    parsed = urlparse(url)
-    return bool(parsed.netloc) and bool(parsed.scheme) and base_domain in parsed.netloc
+# Sidebar: crawl settings
+st.sidebar.header("Crawl settings")
+start_url = st.sidebar.text_input("Start URL (including http:// or https://)", value="https://example.com")
+max_pages = st.sidebar.number_input("Max pages to crawl", min_value=1, max_value=2000, value=500, step=50)
+delay = st.sidebar.slider("Delay between requests (seconds)", min_value=0.0, max_value=5.0, value=0.5, step=0.1)
+same_domain = st.sidebar.checkbox("Restrict to same domain", True)
 
-def get_page_content(url):
-    """
-    Fetches page content with a timeout and user-agent.
-    """
-    try:
-        response = requests.get(url, headers={'User-Agent': USER_AGENT}, timeout=5)
-        response.raise_for_status()
-        return response.text
-    except requests.RequestException:
-        return None
+st.sidebar.markdown("Advanced")
+user_agent = st.sidebar.text_input("User-Agent header", value="site-crawler-bot/1.0")
+timeout = st.sidebar.number_input("Request timeout (s)", min_value=1, value=10)
 
-def search_text_in_soup(soup, query, include_alt, include_meta):
-    """
-    Searches for the query in visible text, alt tags, and meta tags.
-    Returns a list of finding dictionaries.
-    """
-    findings = []
-    query_lower = query.lower()
+# Main controls
+col1, col2 = st.columns([2,1])
 
-    # 1. Search Visible Text
-    # We remove scripts and styles to only search visible text
-    for script in soup(["script", "style"]):
-        script.extract()
-    
-    text = soup.get_text(separator=' ', strip=True)
-    if query_lower in text.lower():
-        # Simple snippet extraction
-        start_idx = text.lower().find(query_lower)
-        snippet = text[max(0, start_idx - 30): min(len(text), start_idx + len(query) + 30)]
-        findings.append({
-            "Type": "Text Content",
-            "Context": f"...{snippet}...",
-            "Match": query
-        })
+with col1:
+    run = st.button("Start crawl")
+    stop = st.button("Stop (not implemented)")  # placeholder for extended functionality
 
-    # 2. Search Image Alt Tags
-    if include_alt:
-        images = soup.find_all('img', alt=True)
-        for img in images:
-            if query_lower in img['alt'].lower():
-                findings.append({
-                    "Type": "Image Alt Tag",
-                    "Context": f"Alt text: {img['alt']}",
-                    "Match": query
-                })
+with col2:
+    st.write("Index status")
+    if "pages" not in st.session_state:
+        st.session_state.pages = []
+    if "index" not in st.session_state:
+        st.session_state.index = None
 
-    # 3. Search Meta Titles & Descriptions
-    if include_meta:
-        # Title
-        if soup.title and query_lower in soup.title.string.lower():
-            findings.append({
-                "Type": "Page Title",
-                "Context": soup.title.string,
-                "Match": query
-            })
-        
-        # Meta Description
-        meta_desc = soup.find('meta', attrs={'name': 'description'})
-        if meta_desc and meta_desc.get('content') and query_lower in meta_desc['content'].lower():
-            findings.append({
-                "Type": "Meta Description",
-                "Context": meta_desc['content'],
-                "Match": query
-            })
+progress_bar = st.progress(0)
+status_text = st.empty()
+log_area = st.empty()
 
-    return findings
-
-def crawl_and_search(start_url, max_pages, query, include_alt, include_meta, progress_bar, status_text):
-    """
-    The main crawling logic using BFS (Breadth-First Search).
-    """
-    domain = urlparse(start_url).netloc
-    visited = set()
-    queue = deque([start_url])
-    results = []
-    
-    pages_crawled = 0
-    
-    # Initialize UI
-    status_text.text(f"Starting crawl on {start_url}...")
-    
-    while queue and pages_crawled < max_pages:
-        url = queue.popleft()
-        
-        if url in visited:
-            continue
-        
-        visited.add(url)
-        pages_crawled += 1
-        
-        # Update UI
-        progress_val = pages_crawled / max_pages
-        progress_bar.progress(progress_val)
-        status_text.text(f"Crawling ({pages_crawled}/{max_pages}): {url}")
-        
-        html_content = get_page_content(url)
-        if not html_content:
-            continue
-            
-        soup = BeautifulSoup(html_content, 'html.parser')
-        
-        # A. Search content
-        page_findings = search_text_in_soup(soup, query, include_alt, include_meta)
-        for finding in page_findings:
-            finding['URL'] = url
-            results.append(finding)
-            
-        # B. Find new links
-        for link in soup.find_all('a', href=True):
-            absolute_link = urljoin(url, link['href'])
-            # Remove fragments (#) to avoid duplicates
-            absolute_link = absolute_link.split('#')[0]
-            
-            if is_valid_url(absolute_link, domain) and absolute_link not in visited:
-                queue.append(absolute_link)
-                
-        time.sleep(0.1) # Be polite to the server
-
-    return results, pages_crawled
-
-# --- STREAMLIT UI ---
-
-st.set_page_config(page_title="SiteCrawler Pro", page_icon="🕷️", layout="wide")
-
-st.title("🕷️ Website Deep Search Crawler")
-st.markdown("""
-This tool meticulously crawls a website to find specific words, phrases, or technical tags.
-**Note:** Please respect website terms of service and robots.txt.
-""")
-
-# Sidebar
-with st.sidebar:
-    st.header("⚙️ Configuration")
-    target_url = st.text_input("Target URL", placeholder="https://example.com")
-    search_query = st.text_input("Search Query", placeholder="e.g., sustainability")
-    
-    st.subheader("Search Scope")
-    include_alt = st.checkbox("Include Image Alt Tags", value=True)
-    include_meta = st.checkbox("Include Titles & Descriptions", value=True)
-    
-    st.subheader("Limits")
-    max_pages = st.slider("Max Pages to Crawl", min_value=10, max_value=2000, value=50)
-    
-    start_btn = st.button("🚀 Start Crawling", type="primary")
-
-# Main Area
-if start_btn:
-    if not target_url or not search_query:
-        st.error("Please provide both a URL and a Search Query.")
+if run:
+    if not start_url.startswith("http"):
+        st.error("Please enter a valid http/https URL.")
     else:
-        # Layout for results
-        col1, col2 = st.columns(2)
-        with col1:
-            st.info(f"Target: {target_url}")
-        with col2:
-            st.info(f"Query: '{search_query}'")
-            
-        # Placeholders for progress
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        # Run Crawler
-        try:
-            results_data, total_pages = crawl_and_search(
-                target_url, max_pages, search_query, include_alt, include_meta, progress_bar, status_text
-            )
-            
-            # Post-processing
-            status_text.success(f"✅ Crawl Complete! Scanned {total_pages} pages.")
-            progress_bar.progress(100)
-            
-            if results_data:
-                df = pd.DataFrame(results_data)
-                
-                # Reorder columns
-                df = df[['Match', 'Type', 'Context', 'URL']]
-                
-                st.subheader(f"📊 Results Found ({len(df)})")
-                st.dataframe(df, use_container_width=True)
-                
-                # Download
-                csv = df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="📥 Download Results CSV",
-                    data=csv,
-                    file_name='crawl_results.csv',
-                    mime='text/csv',
-                )
-            else:
-                st.warning("No matches found matching your query.")
-                
-        except Exception as e:
-            st.error(f"An error occurred: {e}")
+        st.info("Starting crawl — this will run synchronously in the Streamlit session. For large crawls you may want to run separately.")
+        crawler = Crawler(start_url=start_url, max_pages=int(max_pages), delay=float(delay), same_domain=bool(same_domain),
+                          headers={"User-Agent": user_agent}, timeout=int(timeout))
+        pages = []
+        def progress_cb(current, maximum, last_url):
+            try:
+                progress = int((current / maximum) * 100)
+            except Exception:
+                progress = 0
+            progress_bar.progress(min(progress, 100))
+            status_text.markdown(f"Crawled {current}/{maximum}: {last_url}")
+            log_area.text(f"Crawled {current}/{maximum}: {last_url}")
 
+        pages = crawler.crawl(progress_callback=progress_cb)
+        st.session_state.pages = pages
+        st.success(f"Finished crawling: {len(pages)} pages collected.")
+        progress_bar.progress(100)
+        # build index
+        idx = SearchIndex()
+        idx.build(pages)
+        st.session_state.index = idx
+
+# Searching UI
+st.subheader("Search the crawled site")
+if not st.session_state.pages:
+    st.info("No pages indexed yet. Start a crawl to index pages.")
 else:
-    st.info("Enter details in the sidebar and click 'Start Crawling' to begin.")
+    with st.form("search_form"):
+        q = st.text_input("Search query (word or phrase)")
+        phrase = st.checkbox("Treat query as phrase (substring)", value=False)
+        cols = st.multiselect("Fields to search", options=["title","meta","text","alt"], default=["title","meta","text"])
+        max_results = st.slider("Max results", min_value=10, max_value=1000, value=200, step=10)
+        submitted = st.form_submit_button("Search")
+    if submitted and q.strip():
+        idx = st.session_state.index
+        if not idx:
+            st.error("Index not built yet.")
+        else:
+            with st.spinner("Searching..."):
+                results = idx.search(q, fields=cols, phrase=phrase, max_results=max_results)
+            st.success(f"Found {len(results)} result rows")
+            # present results
+            if results:
+                if phrase:
+                    # results contain url/field/snippet/title
+                    df = pd.DataFrame(results)
+                    st.dataframe(df)
+                else:
+                    df = pd.DataFrame(results)
+                    st.dataframe(df)
+                # CSV export
+                csv_buf = StringIO()
+                df.to_csv(csv_buf, index=False)
+                st.download_button("Download results CSV", data=csv_buf.getvalue(), file_name="search_results.csv", mime="text/csv")
+
+                # per-page viewer: pick a result
+                st.markdown("### Inspect a result")
+                pick = st.selectbox("Choose a URL", options=[r["url"] for r in results])
+                page = st.session_state.index.pages.get(pick)
+                if page:
+                    st.markdown(f"**Title:** {page.get('title')}")
+                    st.markdown(f"**Meta description:** {page.get('meta')}")
+                    st.markdown("---")
+                    st.markdown("**Images (src / alt)**")
+                    for img in page.get("images", []):
+                        st.markdown(f"- {img.get('src')} — alt: {img.get('alt')}")
+                    st.markdown("---")
+                    # highlight matches in text (simple)
+                    content = page.get("text", "") or ""
+                    lowq = q.lower()
+                    if phrase:
+                        highlighted = content.replace(q, f"**{q}**")
+                        st.markdown(highlighted[:5000] + ("..." if len(highlighted) > 5000 else ""))
+                    else:
+                        # highlight tokens
+                        import re
+                        tokens = [t.lower() for t in re.findall(r"\w[\w'-]*", q)]
+                        display = content
+                        for tkn in set(tokens):
+                            display = re.sub(f"(?i)({re.escape(tkn)})", r"**\1**", display)
+                        st.markdown(display[:5000] + ("..." if len(display) > 5000 else ""))
+
+                    st.markdown(f"[Open original page]({page.get('url')})")
+            else:
+                st.warning("No matches found.")
