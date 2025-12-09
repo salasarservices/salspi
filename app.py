@@ -11,7 +11,7 @@ try:
     from io import StringIO
     from crawler import Crawler
     from search_index import SearchIndex
-    from db import save_pages_to_mongo, load_pages_from_mongo
+    from db import save_pages_to_mongo, save_ocr_to_mongo, load_pages_from_mongo
 
     import threading
     import queue
@@ -21,7 +21,7 @@ try:
     # --- Constants / Defaults ---
     MAX_PAGES = 5000              # hard limit per your request
     BATCH_SAVE_SIZE = 50          # internal batch save size (no UI exposed)
-    DEFAULT_SEARCH_FIELDS = ["title", "meta", "text", "alt", "headings"]
+    DEFAULT_SEARCH_FIELDS = ["title", "meta", "text", "alt", "headings", "ocr"]
 
     # --- Secrets and credentials detection ---
     mongo_secrets = st.secrets.get("mongo", {}) if hasattr(st, "secrets") else {}
@@ -48,14 +48,13 @@ try:
     # --- UI ---
     st.title("Website Crawler & Search")
     st.markdown(
-        "Crawl a site (up to 5000 pages) and search titles, descriptions, body text, image alt tags and headings. "
+        "Crawl a site (up to 5000 pages) and search titles, descriptions, body text, image alt tags, OCR text and headings. "
         "Single-query search only (search runs across all indexed fields)."
     )
 
     # Sidebar controls (only crawl/settings & sentiment)
     st.sidebar.header("Crawl settings")
     start_url = st.sidebar.text_input("Start URL (including http:// or https://)", value="https://example.com")
-    # max pages removed from UI per your request; fixed MAX_PAGES used internally
     delay = st.sidebar.slider("Delay between requests (seconds)", min_value=0.0, max_value=5.0, value=0.5, step=0.1)
     same_domain = st.sidebar.checkbox("Restrict to same domain", True)
     st.sidebar.markdown("Advanced")
@@ -67,8 +66,6 @@ try:
     if sentiment_backend == "google" and not google_creds_present:
         st.sidebar.warning("Google credentials not found. Set GOOGLE_APPLICATION_CREDENTIALS or st.secrets['google']['credentials'] to use Google NLP.")
     st.sidebar.caption("Google requires GOOGLE_APPLICATION_CREDENTIALS to be set or credentials provided via secrets.")
-
-    # Remove persistence UI elements (persistence to Mongo happens automatically if credentials available)
 
     # Session state init
     if "pages" not in st.session_state:
@@ -95,7 +92,7 @@ try:
     log_area = st.empty()
     running_info = st.empty()
 
-    # Load from MongoDB and build index (keep as utility)
+    # Load from MongoDB and build index (utility)
     st.sidebar.markdown("---")
     if st.sidebar.button("Load from MongoDB and build index"):
         if not mongo_uri:
@@ -137,7 +134,7 @@ try:
         elif not start_url or not start_url.startswith("http"):
             st.error("Please enter a valid http/https Start URL.")
         else:
-            st.info(f"Starting crawl — runs in a background thread; indexing up to {MAX_PAGES} pages and saving to Mongo if configured.")
+            st.info(f"Starting crawl — runs in a background thread; indexing up to {MAX_PAGES} pages and saving OCR to Mongo if configured.")
 
             # Setup queue and thread
             q = queue.Queue()
@@ -149,10 +146,11 @@ try:
                 headers={"User-Agent": user_agent},
                 timeout=int(timeout),
                 sentiment_backend=sentiment_backend,
+                ocr_enabled=True,  # OCR ON by default
             )
 
             def on_page_threadsafe(page):
-                # background thread writes page events only to the queue
+                # background thread places page events on the queue
                 q.put({"type": "page", "page": page})
 
             def crawl_worker():
@@ -164,23 +162,28 @@ try:
                     q.put({"type": "done"})
 
             t = threading.Thread(target=crawl_worker, daemon=True)
+            # reset pages in session_state, start time for ETA
             st.session_state.pages = []
             start_ts = time.time()
             t.start()
 
             inserted_total = 0
             updated_total = 0
+            ocr_inserted = 0
+            ocr_updated = 0
             save_errors = []
             save_buffer = []
 
-            # Poll queue loop: main thread updates UI and performs DB writes in batches
+            # Poll queue loop: updates placed widgets on main thread (real-time)
             while t.is_alive() or not q.empty():
+                # Drain queue
                 while not q.empty():
                     item = q.get_nowait()
                     if item["type"] == "page":
                         page = item["page"]
                         st.session_state.pages.append(page)
                         current = len(st.session_state.pages)
+                        # update progress bar and status
                         try:
                             percent = int((current / float(MAX_PAGES)) * 100)
                         except Exception:
@@ -190,7 +193,7 @@ try:
                         log_area.text(f"Last: {page.get('url')}  |  Title: {page.get('title','')}")
                         running_info.text(eta_text(start_ts, current, MAX_PAGES))
 
-                        # Batch save logic: main thread writes to Mongo in BATCH_SAVE_SIZE chunks
+                        # Add to buffer and persist in batches
                         save_buffer.append(page)
                         if len(save_buffer) >= BATCH_SAVE_SIZE:
                             if mongo_uri:
@@ -202,6 +205,15 @@ try:
                                         save_errors.extend(summary.get("errors"))
                                 except Exception as e:
                                     save_errors.append({"error": str(e)})
+                                # save OCR data for this batch
+                                try:
+                                    ocr_summary = save_ocr_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name="ocr-data", upsert=True)
+                                    ocr_inserted += ocr_summary.get("inserted", 0)
+                                    ocr_updated += ocr_summary.get("updated", 0)
+                                    if ocr_summary.get("errors"):
+                                        save_errors.extend(ocr_summary.get("errors"))
+                                except Exception as e:
+                                    save_errors.append({"ocr_error": str(e)})
                             save_buffer.clear()
 
                     elif item["type"] == "error":
@@ -223,9 +235,18 @@ try:
                             save_errors.extend(summary.get("errors"))
                     except Exception as e:
                         save_errors.append({"error": str(e)})
+                    # OCR save for remaining buffer
+                    try:
+                        ocr_summary = save_ocr_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name="ocr-data", upsert=True)
+                        ocr_inserted += ocr_summary.get("inserted", 0)
+                        ocr_updated += ocr_summary.get("updated", 0)
+                        if ocr_summary.get("errors"):
+                            save_errors.extend(ocr_summary.get("errors"))
+                    except Exception as e:
+                        save_errors.append({"ocr_error": str(e)})
                 save_buffer.clear()
 
-            # Build in-memory index
+            # Build index from collected pages
             idx = SearchIndex()
             idx.build(st.session_state.pages)
             st.session_state.index = idx
@@ -235,23 +256,22 @@ try:
             st.success(f"Finished crawling: {len(st.session_state.pages)} pages collected (max {MAX_PAGES}).")
             if mongo_uri:
                 st.write("Saved to Mongo in incremental batches during crawl (summary):")
-                st.write(f"Inserted (batches): {inserted_total}, Updated (batches): {updated_total}, batch errors: {len(save_errors)}")
+                st.write(f"Pages inserted: {inserted_total}, pages updated: {updated_total}")
+                st.write(f"OCR docs inserted: {ocr_inserted}, OCR docs updated: {ocr_updated}")
                 if save_errors:
                     st.write(save_errors[:10])
             else:
-                st.warning("Mongo URI not configured; pages indexed in-memory only. To persist set st.secrets['mongo']['uri'] or MONGO_URI.")
+                st.warning("Mongo URI not configured; pages (and OCR) indexed in-memory only. To persist set st.secrets['mongo']['uri'] or MONGO_URI.")
 
     # --- Single-query search UI (kept) ---
     st.markdown("---")
     st.subheader("Single query search")
     if not st.session_state.pages:
         st.info("No pages indexed yet. Start a crawl to index pages.")
-        # still show simple search input but disabled
         search_q = st.text_input("Search query (word or phrase)", value="", disabled=True)
     else:
         with st.form("search_form"):
             search_q = st.text_input("Search query (word or phrase)")
-            # Remove "Fields to search" UI per your request; search will always run across all fields
             submitted = st.form_submit_button("Search")
         if submitted and search_q.strip():
             idx = st.session_state.index
@@ -259,7 +279,6 @@ try:
                 st.error("Index not built yet.")
             else:
                 with st.spinner("Searching..."):
-                    # default search across all important fields (title/meta/text/alt/headings)
                     results = idx.search(search_q, fields=DEFAULT_SEARCH_FIELDS, phrase=(" " in search_q.strip()), max_results=500)
                 st.success(f"Found {len(results)} result rows")
                 if results:
@@ -281,9 +300,16 @@ try:
                         for k in sorted(hcounts.keys()):
                             st.write(f"- {k}: {hcounts[k]}")
                         st.markdown("---")
-                        st.markdown("**Images (src / alt)**")
-                        for img in page.get("images", []):
+                        st.markdown("**Images (src / alt / ocr_text)**")
+                        for img in page.get("ocr_details", []):
                             st.write(f"- {img.get('src')} — alt: {img.get('alt')}")
+                            if img.get("ocr_text"):
+                                st.write("  OCR text (trimmed):", (img.get("ocr_text")[:300] + "...") if len(img.get("ocr_text"))>300 else img.get("ocr_text"))
+                            if img.get("ocr_error"):
+                                st.write("  OCR error:", img.get("ocr_error"))
+                        st.markdown("---")
+                        st.markdown("**Aggregated OCR text (page-level)**")
+                        st.write((page.get("ocr_text")[:1000] + "...") if len(page.get("ocr_text",""))>1000 else page.get("ocr_text",""))
                         st.markdown("---")
                         st.markdown("**Sentiment (details)**")
                         sent = page.get("sentiment", {})
