@@ -85,9 +85,26 @@ try:
         else:
             st.write("No pages indexed")
 
-    # Dedicated placeholders for real-time updates
-    progress_placeholder = st.empty()
-    progress_bar = progress_placeholder.progress(0)
+    # Real-time progress area: progress bar, percent text, numeric metrics
+    st.markdown("### Crawl progress (real time)")
+    progress_area_col1, progress_area_col2 = st.columns([3, 2])
+
+    with progress_area_col1:
+        progress_bar_ph = st.empty()
+        progress_bar = progress_bar_ph.progress(0)
+        percent_text_ph = st.empty()
+        percent_text_ph.markdown("Completion: 0%")
+
+    with progress_area_col2:
+        metrics_cols = st.columns(2)
+        pages_crawled_ph = metrics_cols[0].empty()
+        pages_saved_ph = metrics_cols[1].empty()
+        # Another row for OCR and errors
+        metrics_cols2 = st.columns(2)
+        ocr_saved_ph = metrics_cols2[0].empty()
+        errors_ph = metrics_cols2[1].empty()
+
+    # Additional status logs and ETA
     status_text = st.empty()
     log_area = st.empty()
     running_info = st.empty()
@@ -146,7 +163,7 @@ try:
                 headers={"User-Agent": user_agent},
                 timeout=int(timeout),
                 sentiment_backend=sentiment_backend,
-                ocr_enabled=True,  # OCR ON by default
+                ocr_enabled=True,
             )
 
             def on_page_threadsafe(page):
@@ -183,12 +200,24 @@ try:
                         page = item["page"]
                         st.session_state.pages.append(page)
                         current = len(st.session_state.pages)
-                        # update progress bar and status
-                        try:
-                            percent = int((current / float(MAX_PAGES)) * 100)
-                        except Exception:
+
+                        # update progress percentage and bar
+                        percent = int((current / float(MAX_PAGES)) * 100)
+                        if percent < 0:
                             percent = 0
+                        if percent > 100:
+                            percent = 100
                         progress_bar.progress(min(percent, 100))
+                        percent_text_ph.markdown(f"Completion: {percent}%")
+
+                        # update metrics
+                        pages_crawled_ph.metric("Pages crawled", f"{current}")
+                        # pages saved (inserted + updated)
+                        pages_saved_ph.metric("Pages saved", f"{inserted_total + updated_total}")
+                        ocr_saved_ph.metric("OCR docs saved", f"{ocr_inserted + ocr_updated}")
+                        errors_ph.metric("Batch errors", f"{len(save_errors)}")
+
+                        # status/log
                         status_text.markdown(f"Crawled {current}/{MAX_PAGES}: {page.get('url')}")
                         log_area.text(f"Last: {page.get('url')}  |  Title: {page.get('title','')}")
                         running_info.text(eta_text(start_ts, current, MAX_PAGES))
@@ -251,7 +280,16 @@ try:
             idx.build(st.session_state.pages)
             st.session_state.index = idx
 
-            progress_bar.progress(100)
+            # final metric updates
+            total = len(st.session_state.pages)
+            final_percent = int((total / float(MAX_PAGES)) * 100)
+            progress_bar.progress(min(final_percent, 100))
+            percent_text_ph.markdown(f"Completion: {final_percent}%")
+            pages_crawled_ph.metric("Pages crawled", f"{total}")
+            pages_saved_ph.metric("Pages saved", f"{inserted_total + updated_total}")
+            ocr_saved_ph.metric("OCR docs saved", f"{ocr_inserted + ocr_updated}")
+            errors_ph.metric("Batch errors", f"{len(save_errors)}")
+
             running_info.empty()
             st.success(f"Finished crawling: {len(st.session_state.pages)} pages collected (max {MAX_PAGES}).")
             if mongo_uri:
