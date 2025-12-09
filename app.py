@@ -57,7 +57,7 @@ try:
         "Single-query search only (search runs across all indexed fields)."
     )
 
-    # Sidebar controls (only crawl/settings & sentiment)
+    # Sidebar controls (crawl settings & sentiment)
     st.sidebar.header("Crawl settings")
     start_url = st.sidebar.text_input(
         "Start URL (including http:// or https://)", value="https://example.com"
@@ -82,7 +82,7 @@ try:
         "Google requires GOOGLE_APPLICATION_CREDENTIALS to be set or credentials provided via secrets."
     )
 
-    # --- New: MongoDB actions & app controls (left sidebar) ---
+    # --- MongoDB actions & app controls (left sidebar) ---
     st.sidebar.markdown("---")
     st.sidebar.header("MongoDB actions")
 
@@ -106,20 +106,17 @@ try:
 
     # Delete MongoDB data (two-step confirmation)
     st.sidebar.markdown("**Delete MongoDB data (pages + ocr-data)**")
-    delete_clicked = st.sidebar.button("Delete MongoDB data")
-    if delete_clicked:
-        st.sidebar.warning("This will permanently delete the 'pages' and 'ocr-data' collections.")
-        confirm_delete = st.sidebar.text_input(
-            "Type DELETE to confirm permanent removal of those collections", value=""
-        )
-        if confirm_delete == "DELETE":
+    confirm_delete_text = st.sidebar.text_input(
+        "Type DELETE to enable delete button", key="confirm_delete_text"
+    )
+    if confirm_delete_text == "DELETE":
+        if st.sidebar.button("Confirm DELETE collections"):
             if not mongo_uri:
                 st.sidebar.error("Mongo URI not found in secrets or environment (MONGO_URI).")
             else:
                 try:
                     client = get_mongo_client(mongo_uri)
                     db = client[mongo_db]
-                    # drop collections if they exist
                     dropped = []
                     for coll_name in [mongo_collection, "ocr-data"]:
                         if coll_name in db.list_collection_names():
@@ -132,15 +129,14 @@ try:
                     st.session_state.index = None
                 except Exception as e:
                     st.sidebar.error(f"Failed to delete collections: {e}")
-        else:
-            st.sidebar.info("Type DELETE in the box above and press Enter to confirm deletion.")
+    else:
+        st.sidebar.info("Enter DELETE to enable the collection delete button.")
 
     st.sidebar.markdown("---")
     # Refresh app & clear cache button
     if st.sidebar.button("Refresh app & clear cache"):
-        # clear Streamlit caches if available
+        # clear Streamlit caches if available (try both APIs)
         try:
-            # new API
             if hasattr(st, "cache_data") and hasattr(st.cache_data, "clear"):
                 st.cache_data.clear()
         except Exception:
@@ -150,9 +146,12 @@ try:
                 st.cache_resource.clear()
         except Exception:
             pass
-        # clear session state
+        # clear session state except secrets
         for k in list(st.session_state.keys()):
-            del st.session_state[k]
+            try:
+                del st.session_state[k]
+            except Exception:
+                pass
         # re-run to refresh UI
         st.experimental_rerun()
 
@@ -162,7 +161,7 @@ try:
     if "index" not in st.session_state:
         st.session_state.index = None
 
-    # Buttons and status widgets on main area
+    # Main controls
     col1, col2 = st.columns([2, 1])
     with col1:
         start_crawl = st.button("Start crawl")
@@ -273,6 +272,7 @@ try:
             start_ts = time.time()
             t.start()
 
+            # incremental counters and buffers (main thread only)
             inserted_total = 0
             updated_total = 0
             ocr_inserted = 0
@@ -280,113 +280,18 @@ try:
             save_errors = []
             save_buffer = []
 
-            # --- Replace your current poll loop with this block ---
-# t is the background thread; q is queue.Queue populated by the crawler thread
-inserted_total = 0
-updated_total = 0
-ocr_inserted = 0
-ocr_updated = 0
-save_errors = []
-save_buffer = []
-start_ts = time.time()
+            # Poll loop: drain queue, update UI & persist batches (main thread)
+            while t.is_alive() or not q.empty():
+                drained = False
+                while not q.empty():
+                    drained = True
+                    item = q.get_nowait()
+                    if item["type"] == "page":
+                        page = item["page"]
+                        st.session_state.pages.append(page)
+                        current = len(st.session_state.pages)
 
-# Short helper to force safe widget updates (keeps UI responsive)
-def update_ui_counts(current, inserted_total, updated_total, ocr_inserted, ocr_updated, save_errors, start_ts):
-    percent = int((current / float(MAX_PAGES)) * 100)
-    percent = max(0, min(100, percent))
-    progress_bar.progress(percent)
-    percent_text_ph.markdown(f"Completion: {percent}%")
-    pages_crawled_ph.metric("Pages crawled", f"{current}")
-    pages_saved_ph.metric("Pages saved", f"{inserted_total + updated_total}")
-    ocr_saved_ph.metric("OCR docs saved", f"{ocr_inserted + ocr_updated}")
-    errors_ph.metric("Batch errors", f"{len(save_errors)}")
-    running_info.text(eta_text(start_ts, current, MAX_PAGES))
-
-# Poll the queue and update UI in small steps.
-# This loop yields frequently so Streamlit can send updates to the browser.
-while t.is_alive() or not q.empty():
-    # Drain queue completely before sleeping (fast)
-    drained = False
-    while not q.empty():
-        drained = True
-        item = q.get_nowait()
-        if item["type"] == "page":
-            page = item["page"]
-            st.session_state.pages.append(page)
-            current = len(st.session_state.pages)
-
-            # immediate UI update
-            status_text.markdown(f"Crawled {current}/{MAX_PAGES}: {page.get('url')}")
-            log_area.text(f"Last: {page.get('url')}  |  Title: {page.get('title','')}")
-            update_ui_counts(current, inserted_total, updated_total, ocr_inserted, ocr_updated, save_errors, start_ts)
-
-            # append to buffer for DB writes
-            save_buffer.append(page)
-            if len(save_buffer) >= BATCH_SAVE_SIZE:
-                if mongo_uri:
-                    try:
-                        summary = save_pages_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, upsert=True)
-                        inserted_total += summary.get("inserted", 0)
-                        updated_total += summary.get("updated", 0)
-                        if summary.get("errors"):
-                            save_errors.extend(summary.get("errors"))
-                    except Exception as e:
-                        save_errors.append({"error": str(e)})
-                    try:
-                        ocr_summary = save_ocr_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name="ocr-data", upsert=True)
-                        ocr_inserted += ocr_summary.get("inserted", 0)
-                        ocr_updated += ocr_summary.get("updated", 0)
-                        if ocr_summary.get("errors"):
-                            save_errors.extend(ocr_summary.get("errors"))
-                    except Exception as e:
-                        save_errors.append({"ocr_error": str(e)})
-                save_buffer.clear()
-                # update counts after write
-                update_ui_counts(len(st.session_state.pages), inserted_total, updated_total, ocr_inserted, ocr_updated, save_errors, start_ts)
-
-        elif item["type"] == "error":
-            st.error(f"Crawl thread error: {item.get('error')}")
-        elif item["type"] == "done":
-            # nothing special — loop will exit when t.is_alive() is False and queue empty
-            pass
-
-    # Important: small sleep so Streamlit can push updates to browser and keep animation fluid.
-    # This is the critical bit — keep this value small (0.1..0.25 sec).
-    if not drained:
-        # if nothing new, sleep a tiny bit
-        time.sleep(0.12)
-    else:
-        # if we drained items, yield briefly to make UI draw changes
-        time.sleep(0.08)
-
-# After thread completes, flush any remaining save_buffer (same as before)
-if save_buffer:
-    if mongo_uri:
-        try:
-            summary = save_pages_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, upsert=True)
-            inserted_total += summary.get("inserted", 0)
-            updated_total += summary.get("updated", 0)
-            if summary.get("errors"):
-                save_errors.extend(summary.get("errors"))
-        except Exception as e:
-            save_errors.append({"error": str(e)})
-        try:
-            ocr_summary = save_ocr_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name="ocr-data", upsert=True)
-            ocr_inserted += ocr_summary.get("inserted", 0)
-            ocr_updated += ocr_summary.get("updated", 0)
-            if ocr_summary.get("errors"):
-                save_errors.extend(ocr_summary.get("errors"))
-        except Exception as e:
-            save_errors.append({"ocr_error": str(e)})
-    save_buffer.clear()
-
-# Final UI update
-total = len(st.session_state.pages)
-update_ui_counts(total, inserted_total, updated_total, ocr_inserted, ocr_updated, save_errors, start_ts)
-progress_bar.progress(min(int((total/float(MAX_PAGES))*100), 100))
-percent_text_ph.markdown(f"Completion: {int((total/float(MAX_PAGES))*100)}%")
-
-                        # update progress percentage and bar
+                        # update progress percentage and bar (animated updates)
                         percent = int((current / float(MAX_PAGES)) * 100)
                         percent = max(0, min(100, percent))
                         progress_bar.progress(percent)
@@ -394,7 +299,6 @@ percent_text_ph.markdown(f"Completion: {int((total/float(MAX_PAGES))*100)}%")
 
                         # update metrics
                         pages_crawled_ph.metric("Pages crawled", f"{current}")
-                        # pages saved (inserted + updated)
                         pages_saved_ph.metric("Pages saved", f"{inserted_total + updated_total}")
                         ocr_saved_ph.metric("OCR docs saved", f"{ocr_inserted + ocr_updated}")
                         errors_ph.metric("Batch errors", f"{len(save_errors)}")
@@ -444,8 +348,8 @@ percent_text_ph.markdown(f"Completion: {int((total/float(MAX_PAGES))*100)}%")
                     elif item["type"] == "done":
                         pass
 
-                # Yield to Streamlit so widget updates are rendered in browser
-                time.sleep(0.15)
+                # small sleep so Streamlit can push updates to browser and animate the progress bar
+                time.sleep(0.12)
 
             # flush remaining buffer after crawl completes
             if save_buffer:
