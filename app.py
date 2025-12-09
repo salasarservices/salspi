@@ -11,7 +11,12 @@ try:
     from io import StringIO
     from crawler import Crawler
     from search_index import SearchIndex
-    from db import save_pages_to_mongo, save_ocr_to_mongo, load_pages_from_mongo
+    from db import (
+        save_pages_to_mongo,
+        save_ocr_to_mongo,
+        load_pages_from_mongo,
+        get_mongo_client,
+    )
 
     import threading
     import queue
@@ -19,8 +24,8 @@ try:
     import re
 
     # --- Constants / Defaults ---
-    MAX_PAGES = 5000              # hard limit per your request
-    BATCH_SAVE_SIZE = 50          # internal batch save size (no UI exposed)
+    MAX_PAGES = 5000  # hard limit per your request
+    BATCH_SAVE_SIZE = 50  # internal batch save size (no UI exposed)
     DEFAULT_SEARCH_FIELDS = ["title", "meta", "text", "alt", "headings", "ocr"]
 
     # --- Secrets and credentials detection ---
@@ -54,26 +59,110 @@ try:
 
     # Sidebar controls (only crawl/settings & sentiment)
     st.sidebar.header("Crawl settings")
-    start_url = st.sidebar.text_input("Start URL (including http:// or https://)", value="https://example.com")
-    delay = st.sidebar.slider("Delay between requests (seconds)", min_value=0.0, max_value=5.0, value=0.5, step=0.1)
+    start_url = st.sidebar.text_input(
+        "Start URL (including http:// or https://)", value="https://example.com"
+    )
+    delay = st.sidebar.slider(
+        "Delay between requests (seconds)", min_value=0.0, max_value=5.0, value=0.5, step=0.1
+    )
     same_domain = st.sidebar.checkbox("Restrict to same domain", True)
     st.sidebar.markdown("Advanced")
     user_agent = st.sidebar.text_input("User-Agent header", value="site-crawler-bot/1.0")
     timeout = st.sidebar.number_input("Request timeout (s)", min_value=1, value=10)
 
     st.sidebar.header("Sentiment")
-    sentiment_backend = st.sidebar.selectbox("Sentiment backend", options=["nltk", "google"], index=0)
+    sentiment_backend = st.sidebar.selectbox(
+        "Sentiment backend", options=["nltk", "google"], index=0
+    )
     if sentiment_backend == "google" and not google_creds_present:
-        st.sidebar.warning("Google credentials not found. Set GOOGLE_APPLICATION_CREDENTIALS or st.secrets['google']['credentials'] to use Google NLP.")
-    st.sidebar.caption("Google requires GOOGLE_APPLICATION_CREDENTIALS to be set or credentials provided via secrets.")
+        st.sidebar.warning(
+            "Google credentials not found. Set GOOGLE_APPLICATION_CREDENTIALS or st.secrets['google']['credentials'] to use Google NLP."
+        )
+    st.sidebar.caption(
+        "Google requires GOOGLE_APPLICATION_CREDENTIALS to be set or credentials provided via secrets."
+    )
 
-    # Session state init
+    # --- New: MongoDB actions & app controls (left sidebar) ---
+    st.sidebar.markdown("---")
+    st.sidebar.header("MongoDB actions")
+
+    # Refresh MongoDB data (load pages from mongo and rebuild index)
+    if st.sidebar.button("Refresh MongoDB data"):
+        if not mongo_uri:
+            st.sidebar.error("Mongo URI not found in secrets or environment (MONGO_URI).")
+        else:
+            with st.spinner("Refreshing pages from MongoDB and rebuilding index..."):
+                try:
+                    pages = load_pages_from_mongo(
+                        uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, limit=MAX_PAGES
+                    )
+                    st.session_state.pages = pages
+                    idx = SearchIndex()
+                    idx.build(pages)
+                    st.session_state.index = idx
+                    st.sidebar.success(f"Loaded {len(pages)} pages and rebuilt in-memory index.")
+                except Exception as e:
+                    st.sidebar.error(f"Failed to refresh from MongoDB: {e}")
+
+    # Delete MongoDB data (two-step confirmation)
+    st.sidebar.markdown("**Delete MongoDB data (pages + ocr-data)**")
+    delete_clicked = st.sidebar.button("Delete MongoDB data")
+    if delete_clicked:
+        st.sidebar.warning("This will permanently delete the 'pages' and 'ocr-data' collections.")
+        confirm_delete = st.sidebar.text_input(
+            "Type DELETE to confirm permanent removal of those collections", value=""
+        )
+        if confirm_delete == "DELETE":
+            if not mongo_uri:
+                st.sidebar.error("Mongo URI not found in secrets or environment (MONGO_URI).")
+            else:
+                try:
+                    client = get_mongo_client(mongo_uri)
+                    db = client[mongo_db]
+                    # drop collections if they exist
+                    dropped = []
+                    for coll_name in [mongo_collection, "ocr-data"]:
+                        if coll_name in db.list_collection_names():
+                            db.drop_collection(coll_name)
+                            dropped.append(coll_name)
+                    client.close()
+                    st.sidebar.success(f"Dropped collections: {', '.join(dropped) if dropped else 'none found'}")
+                    # clear in-memory index as well
+                    st.session_state.pages = []
+                    st.session_state.index = None
+                except Exception as e:
+                    st.sidebar.error(f"Failed to delete collections: {e}")
+        else:
+            st.sidebar.info("Type DELETE in the box above and press Enter to confirm deletion.")
+
+    st.sidebar.markdown("---")
+    # Refresh app & clear cache button
+    if st.sidebar.button("Refresh app & clear cache"):
+        # clear Streamlit caches if available
+        try:
+            # new API
+            if hasattr(st, "cache_data") and hasattr(st.cache_data, "clear"):
+                st.cache_data.clear()
+        except Exception:
+            pass
+        try:
+            if hasattr(st, "cache_resource") and hasattr(st.cache_resource, "clear"):
+                st.cache_resource.clear()
+        except Exception:
+            pass
+        # clear session state
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        # re-run to refresh UI
+        st.experimental_rerun()
+
+    # --- Session state init (ensure keys exist) ---
     if "pages" not in st.session_state:
         st.session_state.pages = []
     if "index" not in st.session_state:
         st.session_state.index = None
 
-    # Buttons and status widgets
+    # Buttons and status widgets on main area
     col1, col2 = st.columns([2, 1])
     with col1:
         start_crawl = st.button("Start crawl")
@@ -109,7 +198,7 @@ try:
     log_area = st.empty()
     running_info = st.empty()
 
-    # Load from MongoDB and build index (utility)
+    # Load from MongoDB and build index (utility) - kept as alternative
     st.sidebar.markdown("---")
     if st.sidebar.button("Load from MongoDB and build index"):
         if not mongo_uri:
@@ -203,11 +292,8 @@ try:
 
                         # update progress percentage and bar
                         percent = int((current / float(MAX_PAGES)) * 100)
-                        if percent < 0:
-                            percent = 0
-                        if percent > 100:
-                            percent = 100
-                        progress_bar.progress(min(percent, 100))
+                        percent = max(0, min(100, percent))
+                        progress_bar.progress(percent)
                         percent_text_ph.markdown(f"Completion: {percent}%")
 
                         # update metrics
@@ -227,7 +313,13 @@ try:
                         if len(save_buffer) >= BATCH_SAVE_SIZE:
                             if mongo_uri:
                                 try:
-                                    summary = save_pages_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, upsert=True)
+                                    summary = save_pages_to_mongo(
+                                        save_buffer,
+                                        uri=mongo_uri,
+                                        db_name=mongo_db,
+                                        collection_name=mongo_collection,
+                                        upsert=True,
+                                    )
                                     inserted_total += summary.get("inserted", 0)
                                     updated_total += summary.get("updated", 0)
                                     if summary.get("errors"):
@@ -236,7 +328,13 @@ try:
                                     save_errors.append({"error": str(e)})
                                 # save OCR data for this batch
                                 try:
-                                    ocr_summary = save_ocr_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name="ocr-data", upsert=True)
+                                    ocr_summary = save_ocr_to_mongo(
+                                        save_buffer,
+                                        uri=mongo_uri,
+                                        db_name=mongo_db,
+                                        collection_name="ocr-data",
+                                        upsert=True,
+                                    )
                                     ocr_inserted += ocr_summary.get("inserted", 0)
                                     ocr_updated += ocr_summary.get("updated", 0)
                                     if ocr_summary.get("errors"):
@@ -257,7 +355,13 @@ try:
             if save_buffer:
                 if mongo_uri:
                     try:
-                        summary = save_pages_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, upsert=True)
+                        summary = save_pages_to_mongo(
+                            save_buffer,
+                            uri=mongo_uri,
+                            db_name=mongo_db,
+                            collection_name=mongo_collection,
+                            upsert=True,
+                        )
                         inserted_total += summary.get("inserted", 0)
                         updated_total += summary.get("updated", 0)
                         if summary.get("errors"):
@@ -266,7 +370,13 @@ try:
                         save_errors.append({"error": str(e)})
                     # OCR save for remaining buffer
                     try:
-                        ocr_summary = save_ocr_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name="ocr-data", upsert=True)
+                        ocr_summary = save_ocr_to_mongo(
+                            save_buffer,
+                            uri=mongo_uri,
+                            db_name=mongo_db,
+                            collection_name="ocr-data",
+                            upsert=True,
+                        )
                         ocr_inserted += ocr_summary.get("inserted", 0)
                         ocr_updated += ocr_summary.get("updated", 0)
                         if ocr_summary.get("errors"):
@@ -283,7 +393,8 @@ try:
             # final metric updates
             total = len(st.session_state.pages)
             final_percent = int((total / float(MAX_PAGES)) * 100)
-            progress_bar.progress(min(final_percent, 100))
+            final_percent = max(0, min(100, final_percent))
+            progress_bar.progress(final_percent)
             percent_text_ph.markdown(f"Completion: {final_percent}%")
             pages_crawled_ph.metric("Pages crawled", f"{total}")
             pages_saved_ph.metric("Pages saved", f"{inserted_total + updated_total}")
@@ -317,7 +428,9 @@ try:
                 st.error("Index not built yet.")
             else:
                 with st.spinner("Searching..."):
-                    results = idx.search(search_q, fields=DEFAULT_SEARCH_FIELDS, phrase=(" " in search_q.strip()), max_results=500)
+                    results = idx.search(
+                        search_q, fields=DEFAULT_SEARCH_FIELDS, phrase=(" " in search_q.strip()), max_results=500
+                    )
                 st.success(f"Found {len(results)} result rows")
                 if results:
                     df = pd.DataFrame(results)
