@@ -5,19 +5,14 @@ import sys
 # Configure page early
 st.set_page_config(page_title="Website Crawler & Search", layout="wide")
 
-
 def safe_rerun():
-    """
-    Best-effort rerun: call Streamlit's experimental rerun if available.
-    Some Streamlit builds may not expose experimental_rerun, so this will silently no-op.
-    """
+    """Best-effort rerun: call Streamlit's experimental rerun if available."""
     try:
         rerun = getattr(st, "experimental_rerun", None)
         if callable(rerun):
             rerun()
     except Exception:
         pass
-
 
 try:
     import os
@@ -79,30 +74,25 @@ try:
 
     google_creds_present = bool(os.getenv("GOOGLE_APPLICATION_CREDENTIALS"))
 
-    # --- Ensure session_state keys ---
-    if "pages" not in st.session_state:
-        st.session_state.pages = []
-    if "index" not in st.session_state:
-        st.session_state.index = None
-    if "crawl_thread" not in st.session_state:
-        st.session_state.crawl_thread = None
-    if "crawl_queue" not in st.session_state:
-        st.session_state.crawl_queue = None
-    if "crawl_running" not in st.session_state:
-        st.session_state.crawl_running = False
-    if "crawl_start_ts" not in st.session_state:
-        st.session_state.crawl_start_ts = None
-    if "crawl_stats" not in st.session_state:
-        st.session_state.crawl_stats = {"inserted": 0, "updated": 0, "ocr_inserted": 0, "ocr_updated": 0, "errors": []}
+    # --- Ensure session_state defaults (this MUST run before any access) ---
+    defaults = {
+        "pages": [],
+        "index": None,
+        "crawl_thread": None,
+        "crawl_queue": None,
+        "crawl_running": False,
+        "crawl_start_ts": None,
+        "crawl_stats": {"inserted": 0, "updated": 0, "ocr_inserted": 0, "ocr_updated": 0, "errors": []},
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-    # Ensure crawl_running reflects actual thread liveness (reset if thread is gone)
-    _thread = st.session_state.get("crawl_thread")
-    if _thread is None or not getattr(_thread, "is_alive", lambda: False)():
-        st.session_state.crawl_running = False
-        # clear queue references if thread died
-        if st.session_state.get("crawl_thread") is None:
-            # keep queue if present (it may contain un-drained events) — do not delete here
-            pass
+    # If a stored thread exists but is not alive, reset running flag and clear thread reference.
+    stored_thread = st.session_state.get("crawl_thread")
+    if stored_thread is None or not getattr(stored_thread, "is_alive", lambda: False)():
+        st.session_state["crawl_running"] = False
+        # do not forcibly delete queue here; let queue be drained if present
 
     # --- UI Header ---
     st.title("Website Crawler & Search")
@@ -194,13 +184,13 @@ try:
 
     # --- Main controls ---
     col1, col2 = st.columns([2, 1])
-    with col1:
-        start_btn = st.button("Start crawl", disabled=st.session_state.crawl_running)
-        stop_btn = st.button("Stop (not implemented)")
+    # Use get(...) with default to avoid AttributeError if key missing
+    start_btn = col1.button("Start crawl", disabled=st.session_state.get("crawl_running", False))
+    stop_btn = col1.button("Stop (not implemented)")
     with col2:
         st.write("Index status")
-        if st.session_state.pages:
-            st.write(f"Pages indexed: {len(st.session_state.pages)} (in-memory)")
+        if st.session_state.get("pages"):
+            st.write(f"Pages indexed: {len(st.session_state.get('pages', []))} (in-memory)")
         else:
             st.write("No pages indexed")
 
@@ -227,9 +217,9 @@ try:
     # Worker starter: create queue and thread in session_state
     def start_crawl_background():
         q = queue.Queue()
-        st.session_state.crawl_queue = q
-        st.session_state.crawl_start_ts = time.time()
-        st.session_state.crawl_stats = {"inserted": 0, "updated": 0, "ocr_inserted": 0, "ocr_updated": 0, "errors": []}
+        st.session_state["crawl_queue"] = q
+        st.session_state["crawl_start_ts"] = time.time()
+        st.session_state["crawl_stats"] = {"inserted": 0, "updated": 0, "ocr_inserted": 0, "ocr_updated": 0, "errors": []}
 
         # instantiate crawler with chosen sentiment backend and OCR enabled
         crawler = Crawler(
@@ -246,39 +236,38 @@ try:
         def on_page_callback(page):
             # background thread must only put into queue
             try:
-                st.session_state.crawl_queue.put({"type": "page", "page": page})
+                st.session_state["crawl_queue"].put({"type": "page", "page": page})
             except Exception:
-                # fallback: ignore if queue not present
                 pass
 
         def worker():
             try:
                 crawler.crawl(progress_callback=None, on_page=on_page_callback)
                 try:
-                    st.session_state.crawl_queue.put({"type": "done"})
+                    st.session_state["crawl_queue"].put({"type": "done"})
                 except Exception:
                     pass
             except Exception as e:
                 try:
-                    st.session_state.crawl_queue.put({"type": "error", "error": str(e)})
-                    st.session_state.crawl_queue.put({"type": "done"})
+                    st.session_state["crawl_queue"].put({"type": "error", "error": str(e)})
+                    st.session_state["crawl_queue"].put({"type": "done"})
                 except Exception:
                     pass
 
         t = threading.Thread(target=worker, daemon=True)
-        st.session_state.crawl_thread = t
-        st.session_state.crawl_running = True
+        st.session_state["crawl_thread"] = t
+        st.session_state["crawl_running"] = True
         t.start()
 
     # Start button handling
     if start_btn:
-        if not st.session_state.crawl_running:
+        if not st.session_state.get("crawl_running", False):
             if not start_url or not start_url.startswith("http"):
                 st.error("Please enter a valid http/https Start URL.")
             else:
                 start_crawl_background()
                 st.info(f"Starting crawl — runs in background; indexing up to {MAX_PAGES} pages.")
-                # No explicit rerun needed; the queue-drain logic below will run during this execution
+                # no explicit rerun needed; the queue-drain logic below will run in this execution
 
     # --- Queue draining & UI update loop (main thread only) ---
     q = st.session_state.get("crawl_queue")
@@ -298,8 +287,8 @@ try:
                 break
             if item.get("type") == "page":
                 page = item.get("page")
-                st.session_state.pages.append(page)
-                current = len(st.session_state.pages)
+                st.session_state["pages"].append(page)
+                current = len(st.session_state["pages"])
 
                 # UI updates (main thread)
                 percent = int((current / float(MAX_PAGES)) * 100)
@@ -314,7 +303,7 @@ try:
 
                 status_text.markdown(f"Crawled {current}/{MAX_PAGES}: {page.get('url')}")
                 log_area.text(f"Last: {page.get('url')}  |  Title: {page.get('title','')}")
-                running_info.text(eta_text(st.session_state.crawl_start_ts or time.time(), current, MAX_PAGES))
+                running_info.text(eta_text(st.session_state.get("crawl_start_ts") or time.time(), current, MAX_PAGES))
 
                 # Save buffer & batch persist
                 save_buffer.append(page)
@@ -339,21 +328,20 @@ try:
                             stats["errors"].append({"ocr_error": str(e)})
                     save_buffer.clear()
                 # persist stats back to session
-                st.session_state.crawl_stats = stats
+                st.session_state["crawl_stats"] = stats
 
             elif item.get("type") == "error":
                 st.error(f"Crawl thread error: {item.get('error')}")
                 stats["errors"].append({"thread_error": item.get("error")})
-                st.session_state.crawl_stats = stats
+                st.session_state["crawl_stats"] = stats
             elif item.get("type") == "done":
                 # mark done; will handle finalization after loop
                 pass
 
         # If the worker thread is still alive, sleep a bit here and continue draining (keeps UI responsive)
-        if st.session_state.crawl_thread is not None and st.session_state.crawl_thread.is_alive():
+        if st.session_state.get("crawl_thread") is not None and st.session_state.get("crawl_thread").is_alive():
             # brief sleep to avoid tight loop; then continue (no rerun required)
             time.sleep(0.12)
-            # best-effort rerun to let Streamlit refresh UI (may be no-op)
             safe_rerun()
         else:
             # worker finished; flush remaining buffer and finalize
@@ -377,16 +365,16 @@ try:
                     except Exception as e:
                         stats["errors"].append({"ocr_error": str(e)})
                 save_buffer.clear()
-                st.session_state.crawl_stats = stats
+                st.session_state["crawl_stats"] = stats
 
             # Build in-memory index if not already built or after a crawl
-            if st.session_state.pages:
+            if st.session_state.get("pages"):
                 idx = SearchIndex()
-                idx.build(st.session_state.pages)
-                st.session_state.index = idx
+                idx.build(st.session_state["pages"])
+                st.session_state["index"] = idx
 
             # Final UI update
-            total = len(st.session_state.pages)
+            total = len(st.session_state.get("pages", []))
             final_pct = int((total / float(MAX_PAGES)) * 100) if MAX_PAGES > 0 else 100
             final_pct = max(0, min(100, final_pct))
             progress_bar.progress(final_pct)
@@ -397,19 +385,19 @@ try:
             errors_ph.metric("Batch errors", f"{len(stats.get('errors', []))}")
 
             running_info.empty()
-            if st.session_state.crawl_running:
+            if st.session_state.get("crawl_running"):
                 st.success(f"Finished crawling: {total} pages collected (max {MAX_PAGES}).")
             # mark not running
-            st.session_state.crawl_running = False
-            st.session_state.crawl_thread = None
-            st.session_state.crawl_queue = None
-            st.session_state.crawl_start_ts = None
-            st.session_state.crawl_stats = stats
+            st.session_state["crawl_running"] = False
+            st.session_state["crawl_thread"] = None
+            st.session_state["crawl_queue"] = None
+            st.session_state["crawl_start_ts"] = None
+            st.session_state["crawl_stats"] = stats
 
     # --- Single-query search UI ---
     st.markdown("---")
     st.subheader("Single query search")
-    if not st.session_state.pages:
+    if not st.session_state.get("pages"):
         st.info("No pages indexed yet. Start a crawl to index pages.")
         st.text_input("Search query (word or phrase)", value="", disabled=True)
     else:
@@ -417,11 +405,11 @@ try:
             search_q = st.text_input("Search query (word or phrase)")
             submitted = st.form_submit_button("Search")
         if submitted and search_q and search_q.strip():
-            if not st.session_state.index:
+            if not st.session_state.get("index"):
                 st.error("Index not built yet.")
             else:
                 with st.spinner("Searching..."):
-                    results = st.session_state.index.search(search_q, fields=DEFAULT_SEARCH_FIELDS, phrase=(" " in search_q.strip()), max_results=500)
+                    results = st.session_state["index"].search(search_q, fields=DEFAULT_SEARCH_FIELDS, phrase=(" " in search_q.strip()), max_results=500)
                 st.success(f"Found {len(results)} result rows")
                 if results:
                     df = pd.DataFrame(results)
@@ -432,7 +420,7 @@ try:
 
                     st.markdown("### Inspect a result")
                     pick = st.selectbox("Choose a URL", options=[r["url"] for r in results])
-                    page = st.session_state.index.pages.get(pick)
+                    page = st.session_state["index"].pages.get(pick)
                     if page:
                         st.markdown(f"**Title:** {page.get('title')} (length: {page.get('title_len')})")
                         st.markdown(f"**Meta description:** {page.get('meta')} (length: {page.get('meta_len')})")
