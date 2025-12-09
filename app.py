@@ -1,283 +1,267 @@
-import streamlit as st
-import pandas as pd
-from crawler import Crawler
-from search_index import SearchIndex
-from db import save_pages_to_mongo, load_pages_from_mongo
+import re
 import time
-from io import StringIO
+import logging
 import os
+from urllib.parse import urljoin, urlparse
+import requests
+from bs4 import BeautifulSoup
+from urllib import robotparser
+from collections import deque
 
-st.set_page_config(page_title="Website Crawler & Search", layout="wide")
-
-st.title("Website Crawler & Search")
-st.markdown("Crawl a site (limited pages) and search words/phrases in titles, descriptions, body text, image alt tags and headings. Sentiment backend selectable (NLTK or Google NLP).")
-
-# Sidebar: crawl settings
-st.sidebar.header("Crawl settings")
-start_url = st.sidebar.text_input("Start URL (including http:// or https://)", value="https://example.com")
-max_pages = st.sidebar.number_input("Max pages to crawl", min_value=1, max_value=2000, value=500, step=50)
-delay = st.sidebar.slider("Delay between requests (seconds)", min_value=0.0, max_value=5.0, value=0.5, step=0.1)
-same_domain = st.sidebar.checkbox("Restrict to same domain", True)
-st.sidebar.markdown("Advanced")
-user_agent = st.sidebar.text_input("User-Agent header", value="site-crawler-bot/1.0")
-timeout = st.sidebar.number_input("Request timeout (s)", min_value=1, value=10)
-
-# Batch save settings (incremental persistence)
-st.sidebar.header("Persistence")
-batch_size = st.sidebar.number_input("Save to Mongo every N pages (batch size)", min_value=1, max_value=500, value=20, step=1)
-auto_save_mongo = st.sidebar.checkbox("Auto-save crawl to MongoDB after finishing", value=False)
-
-# Sentiment backend selection
-st.sidebar.header("Sentiment")
-sentiment_backend = st.sidebar.selectbox("Sentiment backend", options=["nltk", "google"], index=0)
-st.sidebar.caption("Google requires GOOGLE_APPLICATION_CREDENTIALS to be set or credentials provided via secrets.")
-
-# NOTE: MongoDB and Google credentials are read from Streamlit secrets (hidden)
-mongo_secrets = st.secrets.get("mongo", {}) if hasattr(st, "secrets") else {}
-mongo_uri = mongo_secrets.get("uri") or os.getenv("MONGO_URI")
-mongo_db = mongo_secrets.get("db", "sitecrawler")
-mongo_collection = mongo_secrets.get("collection", "pages")
-
-google_secrets = st.secrets.get("google", {}) if hasattr(st, "secrets") else {}
-# Optionally allow a JSON key stored in secrets under google.credentials (string)
-google_creds_json = google_secrets.get("credentials")  # optional JSON string
-# If you provide the JSON string, write it to a temp file and set GOOGLE_APPLICATION_CREDENTIALS
-if sentiment_backend == "google" and google_creds_json:
-    creds_path = "/tmp/streamlit_google_creds.json"
+# NLTK VADER fallback
+try:
+    from nltk.sentiment import SentimentIntensityAnalyzer
+    import nltk
     try:
-        with open(creds_path, "w") as f:
-            f.write(google_creds_json)
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
-    except Exception as e:
-        st.warning(f"Could not write Google credentials to temp file: {e}")
-
-# Initialize session state
-if "pages" not in st.session_state:
-    st.session_state.pages = []
-if "index" not in st.session_state:
-    st.session_state.index = None
-
-# Main controls
-col1, col2 = st.columns([2,1])
-
-with col1:
-    run = st.button("Start crawl")
-    stop = st.button("Stop (not implemented)")  # placeholder
-with col2:
-    st.write("Index status")
-    if st.session_state.pages:
-        st.write(f"Pages indexed: {len(st.session_state.pages)}")
-    else:
-        st.write("No pages indexed")
-
-progress_bar = st.progress(0)
-status_text = st.empty()
-log_area = st.empty()
-
-# Load from MongoDB button
-st.sidebar.markdown("---")
-if st.sidebar.button("Load from MongoDB and build index"):
-    if not mongo_uri:
-        st.sidebar.error("Mongo URI not found in secrets or environment (MONGO_URI).")
-    else:
-        with st.spinner("Loading pages from MongoDB..."):
-            try:
-                pages = load_pages_from_mongo(uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, limit=max_pages)
-                st.session_state.pages = pages
-                idx = SearchIndex()
-                idx.build(pages)
-                st.session_state.index = idx
-                st.sidebar.success(f"Loaded {len(pages)} pages and rebuilt in-memory index.")
-            except Exception as e:
-                st.sidebar.error(f"Failed to load from MongoDB: {e}")
-
-if run:
-    if not start_url.startswith("http"):
-        st.error("Please enter a valid http/https URL.")
-    else:
-        st.info("Starting crawl — this will run synchronously in the Streamlit session. For large crawls run separately.")
-        # instantiate crawler with chosen sentiment backend
-        crawler = Crawler(start_url=start_url, max_pages=int(max_pages), delay=float(delay), same_domain=bool(same_domain),
-                          headers={"User-Agent": user_agent}, timeout=int(timeout),
-                          sentiment_backend=sentiment_backend)
-
-        # incremental save buffer and stats (use mutable dict to avoid nonlocal)
-        save_buffer = []
-        stats = {"inserted": 0, "updated": 0, "errors": []}
-
-        def on_page_callback(page):
-            """
-            Called per page during crawl. Append to session pages and buffer for persistence.
-            Uses the outer 'save_buffer' list and 'stats' dict (mutated directly).
-            """
-            # update in-memory pages
-            st.session_state.pages.append(page)
-            save_buffer.append(page)
-
-            # When buffer reaches batch_size, persist to Mongo (if configured)
-            if len(save_buffer) >= batch_size:
-                if mongo_uri:
-                    try:
-                        summary = save_pages_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, upsert=True)
-                        stats["inserted"] += summary.get("inserted", 0)
-                        stats["updated"] += summary.get("updated", 0)
-                        if summary.get("errors"):
-                            stats["errors"].extend(summary.get("errors"))
-                            # small informational notification
-                            st.warning(f"A batch save completed with {len(summary['errors'])} errors (check logs).")
-                    except Exception as e:
-                        stats["errors"].append({"error": str(e)})
-                        st.error(f"Batch save failed: {e}")
-                # clear the buffer after attempt (whether or not saved)
-                save_buffer.clear()
-
-        def progress_cb(current, maximum, last_url):
-            try:
-                progress = int((current / maximum) * 100)
-            except Exception:
-                progress = 0
-            progress_bar.progress(min(progress, 100))
-            status_text.markdown(f"Crawled {current}/{maximum}: {last_url}")
-            log_area.text(f"Crawled {current}/{maximum}: {last_url}")
-
-        # reset session pages before crawl unless you want to append
-        st.session_state.pages = []
+        nltk.data.find("sentiment/vader_lexicon.zip")
+    except Exception:
         try:
-            pages = crawler.crawl(progress_callback=progress_cb, on_page=on_page_callback)
+            nltk.download("vader_lexicon")
+        except Exception:
+            pass
+    _SIA = SentimentIntensityAnalyzer()
+except Exception:
+    _SIA = None
+
+# Google Cloud client (optional)
+try:
+    from google.cloud import language_v1
+    _HAS_GOOGLE = True
+except Exception:
+    _HAS_GOOGLE = False
+
+logger = logging.getLogger("site_crawler")
+logging.basicConfig(level=logging.INFO)
+
+DEFAULT_HEADERS = {
+    "User-Agent": "site-crawler-bot/1.0 (+https://example.com)"
+}
+
+class Crawler:
+    """
+    Crawler with optional sentiment backend. To persist pages during crawl, pass an on_page callback:
+      def on_page(page): ...
+    The on_page callback is called immediately after a page is successfully extracted.
+    """
+    def __init__(self, start_url, max_pages=2000, delay=0.5, same_domain=True, headers=None, timeout=10,
+                 sentiment_backend="nltk", google_credentials_env_var=None):
+        self.start_url = start_url.rstrip("/")
+        self.max_pages = max_pages
+        self.delay = delay
+        self.same_domain = same_domain
+        self.headers = headers or DEFAULT_HEADERS
+        self.timeout = timeout
+
+        parsed = urlparse(self.start_url)
+        self.root_netloc = parsed.netloc
+        self.scheme = parsed.scheme
+
+        self.visited = set()
+        self.results = []  # list of dicts per page
+        self.rp = robotparser.RobotFileParser()
+        self._init_robots()
+
+        # sentiment backend: "nltk" or "google"
+        self.sentiment_backend = sentiment_backend.lower() if sentiment_backend else "nltk"
+
+        # optionally set credentials env var for google client (if provided)
+        if google_credentials_env_var:
+            # caller should set os.environ[google_credentials_env_var] to a path or JSON string prior to initialization.
+            os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", google_credentials_env_var)
+
+        # lazy init google client only if requested
+        self._google_client = None
+
+    def _init_robots(self):
+        robots_url = urljoin(f"{self.scheme}://{self.root_netloc}", "/robots.txt")
+        try:
+            self.rp.set_url(robots_url)
+            self.rp.read()
+        except Exception:
+            # ignore robots failures and assume allowed
+            logger.info("Could not read robots.txt, proceeding without it.")
+
+    def _allowed(self, url):
+        try:
+            return self.rp.can_fetch(self.headers.get("User-Agent", "*"), url)
+        except Exception:
+            return True
+
+    def _same_domain(self, url):
+        if not self.same_domain:
+            return True
+        parsed = urlparse(url)
+        return parsed.netloc == self.root_netloc
+
+    def _normalize(self, link, base):
+        if not link:
+            return None
+        link = link.strip()
+        if link.startswith("javascript:") or link.startswith("mailto:"):
+            return None
+        return urljoin(base, link.split("#")[0])
+
+    def _ensure_google_client(self):
+        if not _HAS_GOOGLE:
+            raise RuntimeError("google-cloud-language library not available (not installed).")
+        if not self._google_client:
+            self._google_client = language_v1.LanguageServiceClient()
+        return self._google_client
+
+    def _analyze_sentiment_nltk(self, text: str):
+        if not text or _SIA is None:
+            return {"compound": 0.0, "pos": 0.0, "neu": 1.0, "neg": 0.0, "backend": "nltk"}
+        try:
+            scores = _SIA.polarity_scores(text)
+            scores["backend"] = "nltk"
+            return scores
+        except Exception:
+            return {"compound": 0.0, "pos": 0.0, "neu": 1.0, "neg": 0.0, "backend": "nltk"}
+
+    def _analyze_sentiment_google(self, text: str):
+        """
+        Returns: {"score": float, "magnitude": float, "backend": "google"}.
+        Also include "compound" key mapped to score for compatibility.
+        """
+        if not text:
+            return {"score": 0.0, "magnitude": 0.0, "compound": 0.0, "backend": "google"}
+        try:
+            client = self._ensure_google_client()
+            document = language_v1.Document(content=text, type_=language_v1.Document.Type.PLAIN_TEXT)
+            response = client.analyze_sentiment(request={'document': document, 'encoding_type': language_v1.EncodingType.UTF8})
+            # overall document sentiment
+            score = response.document_sentiment.score
+            magnitude = response.document_sentiment.magnitude
+            return {"score": float(score), "magnitude": float(magnitude), "compound": float(score), "backend": "google"}
         except Exception as e:
-            st.error(f"Crawl failed with exception: {e}")
-            pages = st.session_state.pages  # whatever we have so far
+            logger.exception("Google NLP sentiment failed: %s", e)
+            return {"score": 0.0, "magnitude": 0.0, "compound": 0.0, "backend": "google", "error": str(e)}
 
-        # save any remaining buffer
-        if save_buffer:
-            if mongo_uri:
-                try:
-                    summary = save_pages_to_mongo(save_buffer, uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, upsert=True)
-                    stats["inserted"] += summary.get("inserted", 0)
-                    stats["updated"] += summary.get("updated", 0)
-                    if summary.get("errors"):
-                        stats["errors"].extend(summary.get("errors"))
-                except Exception as e:
-                    stats["errors"].append({"error": str(e)})
-            save_buffer.clear()
-
-        st.session_state.pages = pages or st.session_state.pages
-        st.success(f"Finished crawling: {len(st.session_state.pages)} pages collected.")
-        progress_bar.progress(100)
-
-        # build index automatically
-        idx = SearchIndex()
-        idx.build(st.session_state.pages)
-        st.session_state.index = idx
-        st.info("Built in-memory search index (includes headings and image alt tags).")
-
-        if auto_save_mongo:
-            if not mongo_uri:
-                st.error("Auto-save requested but Mongo secrets not found. Make sure you set Streamlit secrets for mongo.uri or set MONGO_URI.")
-            else:
-                with st.spinner("Saving all pages to MongoDB (final save)..."):
-                    try:
-                        summary = save_pages_to_mongo(st.session_state.pages, uri=mongo_uri, db_name=mongo_db, collection_name=mongo_collection, upsert=True)
-                        if summary.get("errors"):
-                            st.warning(f"Completed with errors: {len(summary['errors'])} (first: {summary['errors'][0]})")
-                        st.success(f"Saved to MongoDB — inserted: {summary.get('inserted',0)}, updated: {summary.get('updated',0)}")
-                    except Exception as e:
-                        st.error(f"Error saving to MongoDB: {e}")
-
-        # show save summary (from incremental batches)
-        st.write("Incremental save summary during crawl:")
-        st.write(f"Total inserted (batches): {stats['inserted']}, total updated (batches): {stats['updated']}, batch errors: {len(stats['errors'])}")
-        if stats["errors"]:
-            st.write(stats["errors"][:5])
-
-st.markdown("---")
-
-# Batch queries textbox (main UI)
-st.subheader("Batch search queries")
-st.markdown("Enter one word or phrase per line. Press 'Run batch search' to execute searches for each line.")
-batch_input = st.text_area("Queries (one per line)", height=120, placeholder="e.g.\ncontact\nabout us\nprivacy policy\nproduct features")
-
-col_run, col_space = st.columns([1,4])
-with col_run:
-    run_batch = st.button("Run batch search")
-
-if run_batch:
-    if not batch_input.strip():
-        st.warning("Please enter one or more queries (one per line).")
-    elif not st.session_state.index:
-        st.error("Index not built. Run a crawl first to build the index (or load from DB / build index).")
-    else:
-        queries = [line.strip() for line in batch_input.splitlines() if line.strip()]
-        st.info(f"Running {len(queries)} queries...")
-        for q in queries:
-            is_phrase = " " in q.strip()
-            res = st.session_state.index.search(q, fields=["title","meta","text","alt","headings"], phrase=is_phrase, max_results=200)
-            st.markdown(f"#### Query: `{q}` — {len(res)} result(s)")
-            if res:
-                df = pd.DataFrame(res[:20])
-                st.dataframe(df)
-            else:
-                st.write("No results found.")
-
-st.markdown("---")
-
-# Single-query search UI
-st.subheader("Single query search")
-if not st.session_state.pages:
-    st.info("No pages indexed yet. Start a crawl to index pages.")
-else:
-    with st.form("search_form"):
-        q = st.text_input("Search query (word or phrase)")
-        phrase = st.checkbox("Treat query as phrase (substring)", value=False)
-        cols = st.multiselect("Fields to search", options=["title","meta","text","alt","headings"], default=["title","meta","text"])
-        max_results = st.slider("Max results", min_value=10, max_value=1000, value=200, step=10)
-        submitted = st.form_submit_button("Search")
-    if submitted and q.strip():
-        idx = st.session_state.index
-        if not idx:
-            st.error("Index not built yet.")
+    def _analyze_sentiment(self, text: str):
+        if self.sentiment_backend == "google":
+            return self._analyze_sentiment_google(text)
         else:
-            with st.spinner("Searching..."):
-                results = idx.search(q, fields=cols, phrase=phrase, max_results=max_results)
-            st.success(f"Found {len(results)} result rows")
-            if results:
-                df = pd.DataFrame(results)
-                st.dataframe(df)
-                csv_buf = StringIO()
-                df.to_csv(csv_buf, index=False)
-                st.download_button("Download results CSV", data=csv_buf.getvalue(), file_name="search_results.csv", mime="text/csv")
+            return self._analyze_sentiment_nltk(text)
 
-                st.markdown("### Inspect a result")
-                pick = st.selectbox("Choose a URL", options=[r["url"] for r in results])
-                page = st.session_state.index.pages.get(pick)
-                if page:
-                    st.markdown(f"**Title:** {page.get('title')} (length: {page.get('title_len')})")
-                    st.markdown(f"**Meta description:** {page.get('meta')} (length: {page.get('meta_len')})")
-                    st.markdown(f"**Main content length:** {page.get('content_len')}")
-                    st.markdown("**Heading counts:**")
-                    hcounts = page.get("h_counts", {})
-                    for k in sorted(hcounts.keys()):
-                        st.write(f"- {k}: {hcounts[k]}")
-                    st.markdown("---")
-                    st.markdown("**Images (src / alt)**")
-                    for img in page.get("images", []):
-                        st.write(f"- {img.get('src')} — alt: {img.get('alt')}")
-                    st.markdown("---")
-                    st.markdown("**Sentiment (details)**")
-                    sent = page.get("sentiment", {})
-                    st.write(sent)
-                    st.markdown("---")
-                    content = page.get("text", "") or ""
-                    if phrase:
-                        highlighted = content.replace(q, f"**{q}**")
-                        st.markdown(highlighted[:5000] + ("..." if len(highlighted) > 5000 else ""))
-                    else:
-                        import re
-                        tokens = [t.lower() for t in re.findall(r"\w[\w'-]*", q)]
-                        display = content
-                        for tkn in set(tokens):
-                            display = re.sub(f"(?i)({re.escape(tkn)})", r"**\1**", display)
-                        st.markdown(display[:5000] + ("..." if len(display) > 5000 else ""))
-                    st.markdown(f"[Open original page]({page.get('url')})")
-            else:
-                st.warning("No matches found.")
+    def _extract(self, html, url):
+        soup = BeautifulSoup(html, "lxml")
+
+        title_tag = soup.title.string.strip() if soup.title and soup.title.string else ""
+        meta_desc = ""
+        desc_tag = soup.find("meta", attrs={"name": re.compile("description", re.I)})
+        if desc_tag and desc_tag.get("content"):
+            meta_desc = desc_tag["content"].strip()
+
+        # remove script/style
+        for script in soup(["script", "style", "noscript"]):
+            script.decompose()
+        text = soup.get_text(separator=" ", strip=True)
+
+        images = []
+        for img in soup.find_all("img"):
+            src = img.get("src") or ""
+            alt = img.get("alt") or ""
+            src = urljoin(url, src)
+            images.append({"src": src, "alt": alt})
+
+        # headings
+        h_counts = {}
+        headings_text_parts = []
+        for i in range(1, 7):
+            tag = f"h{i}"
+            found = soup.find_all(tag)
+            h_counts[tag] = len(found)
+            for fh in found:
+                headings_text_parts.append(fh.get_text(" ", strip=True))
+
+        headings_text = " ".join([p for p in headings_text_parts if p])
+
+        links = []
+        for a in soup.find_all("a", href=True):
+            href = self._normalize(a["href"], url)
+            if href:
+                links.append(href)
+
+        title_len = len(title_tag)
+        meta_len = len(meta_desc)
+        content_len = len(text)
+
+        sentiment_source = " ".join([title_tag, meta_desc, headings_text, text])
+        sentiment = self._analyze_sentiment(sentiment_source)
+
+        return {
+            "url": url,
+            "title": title_tag,
+            "title_len": title_len,
+            "meta": meta_desc,
+            "meta_len": meta_len,
+            "text": text,
+            "content_len": content_len,
+            "images": images,
+            "image_alts": [img.get("alt", "") for img in images],
+            "h_counts": h_counts,
+            "headings": headings_text,
+            "links": links,
+            "sentiment": sentiment,
+        }
+
+    def crawl(self, progress_callback=None, on_page=None):
+        """
+        Breadth-first crawl from start_url until max_pages or queue exhausted.
+        progress_callback(current_count, max_pages, last_url) can be provided.
+        on_page(page_dict) will be called for each extracted page (useful for incremental persistence).
+        """
+        q = deque([self.start_url])
+        self.visited = set()
+        self.results = []
+
+        while q and len(self.results) < self.max_pages:
+            url = q.popleft()
+            if url in self.visited:
+                continue
+            if not url.startswith("http"):
+                continue
+            if not self._same_domain(url):
+                continue
+            if not self._allowed(url):
+                logger.debug(f"Blocked by robots: {url}")
+                self.visited.add(url)
+                continue
+
+            try:
+                resp = requests.get(url, headers=self.headers, timeout=self.timeout)
+                content_type = resp.headers.get("Content-Type", "")
+                if resp.status_code != 200 or "html" not in content_type:
+                    logger.debug(f"Skipping non-HTML or non-200: {url} ({resp.status_code})")
+                    self.visited.add(url)
+                    if progress_callback:
+                        progress_callback(len(self.results), self.max_pages, url)
+                    continue
+                page = self._extract(resp.text, url)
+                self.results.append(page)
+                self.visited.add(url)
+
+                # call per-page callback for persistence
+                if on_page:
+                    try:
+                        on_page(page)
+                    except Exception:
+                        logger.exception("on_page callback raised an exception")
+
+                # enqueue discovered links
+                for link in page["links"]:
+                    if link not in self.visited and link not in q:
+                        if self._same_domain(link):
+                            q.append(link)
+
+                if progress_callback:
+                    progress_callback(len(self.results), self.max_pages, url)
+
+                time.sleep(self.delay)
+            except Exception as e:
+                logger.debug(f"Error fetching {url}: {e}")
+                self.visited.add(url)
+                if progress_callback:
+                    progress_callback(len(self.results), self.max_pages, url)
+                time.sleep(self.delay)
+        return self.results
