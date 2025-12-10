@@ -4,8 +4,6 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import pymongo
-import networkx as nx
-from pyvis.network import Network
 import tempfile
 import time
 import hashlib
