@@ -135,24 +135,20 @@ def crawl_site(start_url, max_pages):
                 "page_text": ""
             }
 
-            # Check if valid HTML content
             if response.status_code == 200 and 'text/html' in page_data['content_type']:
                 soup = BeautifulSoup(response.text, 'html.parser')
                 
-                # Metadata
                 page_data['title'] = soup.title.string.strip() if soup.title and soup.title.string else ""
                 meta_desc = soup.find('meta', attrs={'name': 'description'})
                 page_data['meta_desc'] = meta_desc['content'].strip() if meta_desc and meta_desc.get('content') else ""
                 canonical = soup.find('link', rel='canonical')
                 page_data['canonical'] = canonical['href'] if canonical else ""
                 
-                # Content
                 text_content = soup.get_text(separator=' ', strip=True)
                 page_data['word_count'] = len(text_content.split())
                 page_data['content_hash'] = get_page_hash(text_content)
                 page_data['page_text'] = text_content
                 
-                # Images
                 imgs = soup.find_all('img')
                 for img in imgs:
                     src = img.get('src')
@@ -162,12 +158,10 @@ def crawl_site(start_url, max_pages):
                             'alt': img.get('alt', '')
                         })
 
-                # Robots
                 robots_meta = soup.find('meta', attrs={'name': 'robots'})
                 if robots_meta and 'noindex' in robots_meta.get('content', '').lower():
                     page_data['indexable'] = False
 
-                # Links
                 all_links = soup.find_all('a', href=True)
                 for link in all_links:
                     raw_link = link['href'].strip()
@@ -270,7 +264,6 @@ def render_metric_card(label, value, df_subset, key_suffix):
         """, unsafe_allow_html=True)
         if value > 0:
             with st.expander(f"View Details"):
-                # Safety Limit: Show max 50 rows to prevent crash
                 limit = 50
                 display_df = df_subset[['url', 'status_code']].head(limit)
                 st.dataframe(display_df, use_container_width=True)
@@ -351,69 +344,82 @@ with tab1:
     else:
         st.info("No crawl data found. Enter a URL in the sidebar and click 'Start Crawl'.")
 
-# --- SITE STRUCTURE (STAR/CLUSTER LAYOUT) ---
+# --- SITE STRUCTURE (HIERARCHICAL TREE) ---
 with tab2:
     if full_df is not None:
-        st.subheader("Site Architecture")
-        st.info("Visualizing site connectivity. Nodes are colored by Status Code (Blue=200, Red=Errors).")
+        st.subheader("Site Architecture Tree")
+        st.info("Visualizing site hierarchy. Scroll to zoom, drag to move.")
         
         # 1. Build NetworkX Graph
         G = nx.DiGraph()
         
-        # Limit to 300 nodes to prevent browser crash (Page Unresponsive error)
+        # Limit to 300 nodes for safety
         limit_nodes = 300
         viz_df = full_df.head(limit_nodes)
         
         if len(full_df) > limit_nodes:
-            st.warning(f"⚠️ Graph limited to first {limit_nodes} pages to prevent browser crash. ({len(full_df)} total)")
+            st.warning(f"⚠️ Displaying top {limit_nodes} pages to prevent browser crash (out of {len(full_df)}).")
 
         for _, row in viz_df.iterrows():
             # Tooltip
             hover = f"{row['url']}\nTitle: {row['title']}"
             
-            # Color Logic (Similar to your red/cluster reference)
-            # 200 = Blue, 404/500 = Red, 301 = Orange
+            # Color Logic: 200 (Blue), Errors (Red), Redirects (Orange)
             color = "#4A90E2" 
             if 300 <= row['status_code'] < 400: color = "#F5A623"
-            elif row['status_code'] >= 400: color = "#D0021B" # Red for errors
+            elif row['status_code'] >= 400: color = "#D0021B"
             
-            # Size nodes based on incoming links (simplified proxy: more important pages are bigger)
-            size = 15 
-            
-            G.add_node(row['url'], title=hover, color=color, value=size, label=' ')
+            # Use dot shape for clean tree look
+            G.add_node(row['url'], title=hover, color=color, label=' ')
             
             if isinstance(row['links'], list):
                 for link in row['links']:
                     if link in viz_df['url'].values:
-                        G.add_edge(row['url'], link, color="#888888") # Grey edges like reference
+                        # Blue Arrow for outgoing links
+                        G.add_edge(row['url'], link, color="#2B7CE9")
 
-        # 2. PyVis Configuration (Force Directed for Star Shape)
+        # 2. PyVis Configuration (HIERARCHICAL / TREE)
         net = Network(height='650px', width='100%', bgcolor='#ffffff', font_color='black', directed=True)
         net.from_nx(G)
         
-        # Physics options to mimic the "Star/Hub-Spoke" look
+        # Configure for strict Top-Down Tree Layout
         options = {
-            "nodes": {
-                "shape": "dot",
-                "scaling": {"min": 10, "max": 30}
+            "layout": {
+                "hierarchical": {
+                    "enabled": True,
+                    "levelSeparation": 150,
+                    "nodeSpacing": 100,
+                    "treeSpacing": 200,
+                    "blockShifting": True,
+                    "edgeMinimization": True,
+                    "parentCentralization": True,
+                    "direction": "UD",        # Up-Down
+                    "sortMethod": "directed", # Arrange by connection
+                    "shakeTowards": "roots"
+                }
             },
             "edges": {
-                "color": {"inherit": False},
-                "smooth": {"type": "continuous"}
+                "smooth": {
+                    "type": "cubicBezier",
+                    "forceDirection": "vertical",
+                    "roundness": 0.4
+                },
+                "arrows": {
+                    "to": {"enabled": True, "scaleFactor": 0.5}
+                }
             },
             "physics": {
-                "forceAtlas2Based": {
-                    "gravitationalConstant": -50,
-                    "centralGravity": 0.01,
+                "hierarchicalRepulsion": {
+                    "centralGravity": 0.0,
                     "springLength": 100,
-                    "springConstant": 0.08
+                    "springConstant": 0.01,
+                    "nodeDistance": 120,
+                    "damping": 0.09
                 },
-                "maxVelocity": 50,
-                "solver": "forceAtlas2Based",
-                "timestep": 0.35,
-                "stabilization": {"enabled": True, "iterations": 150} # Stabilize before showing
+                "solver": "hierarchicalRepulsion"
             }
         }
+        
         net.set_options(json.dumps(options))
         
         # 3. Render
@@ -434,7 +440,6 @@ with tab3:
     search_col = get_db_collection()
     if query and search_col is not None:
         try:
-            # Optimize: Only fetch necessary fields, limit results
             results = list(search_col.find(
                 {"page_text": {"$regex": query, "$options": "i"}},
                 {"url": 1, "page_text": 1, "_id": 0}
@@ -449,7 +454,6 @@ with tab3:
                     idx = text.lower().find(query.lower())
                     
                     if idx != -1:
-                        # Extract 50 chars before and after
                         start = max(0, idx - 50)
                         end = min(len(text), idx + len(query) + 50)
                         snippet = "..." + text[start:end] + "..."
