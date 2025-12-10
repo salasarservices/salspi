@@ -12,6 +12,10 @@ import hashlib
 import os
 from datetime import datetime
 import json
+import urllib3
+
+# Suppress SSL warnings for robust crawling
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- CONFIGURATION & STYLING ---
 st.set_page_config(page_title="SeoSpider Pro", page_icon="🕸️", layout="wide")
@@ -84,12 +88,23 @@ def get_db_collection():
 def get_page_hash(content):
     return hashlib.md5(content.encode('utf-8')).hexdigest()
 
+def normalize_url(url):
+    """Strips query params and trailing slashes for consistent matching"""
+    parsed = urlparse(url)
+    # Rebuild without query or fragment
+    clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    return clean.rstrip('/')
+
 def crawl_site(start_url, max_pages):
     collection = get_db_collection()
     if collection is None:
-        st.error("Database unavailable. Please check server logs.")
+        st.error("Database unavailable. Check secrets.")
         return
     
+    # Clean start URL
+    start_url = normalize_url(start_url)
+    
+    # Parse domain
     parsed_start = urlparse(start_url)
     base_domain = parsed_start.netloc.replace('www.', '')
     
@@ -100,25 +115,36 @@ def crawl_site(start_url, max_pages):
     progress_bar = st.progress(0)
     status_text = st.empty()
     
+    # Standard Browser Header to prevent blocking
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Connection': 'keep-alive',
+    }
+    
     while queue and count < max_pages:
         url = queue.pop(0)
-        url = url.split('#')[0].rstrip('/')
         
         if url in visited: continue
         visited.add(url)
         count += 1
         
         progress_bar.progress(count / max_pages)
-        status_text.text(f"Crawling ({count}/{max_pages}): {url}")
+        status_text.text(f"Crawling {count}/{max_pages}: {url}")
         
         try:
-            time.sleep(0.05)
+            time.sleep(0.1) # Be polite
             start_time = time.time()
-            response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}, timeout=10)
+            
+            # verify=False handles sites with self-signed or older SSL certs
+            response = requests.get(url, headers=headers, timeout=15, verify=False)
             latency = (time.time() - start_time) * 1000
             
+            final_url = normalize_url(response.url) # Handle redirects
+            
             page_data = {
-                "url": url,
+                "url": final_url,
                 "domain": base_domain,
                 "status_code": response.status_code,
                 "content_type": response.headers.get('Content-Type', ''),
@@ -138,17 +164,20 @@ def crawl_site(start_url, max_pages):
             if response.status_code == 200 and 'text/html' in page_data['content_type']:
                 soup = BeautifulSoup(response.text, 'html.parser')
                 
+                # Metadata
                 page_data['title'] = soup.title.string.strip() if soup.title and soup.title.string else ""
                 meta_desc = soup.find('meta', attrs={'name': 'description'})
                 page_data['meta_desc'] = meta_desc['content'].strip() if meta_desc and meta_desc.get('content') else ""
                 canonical = soup.find('link', rel='canonical')
                 page_data['canonical'] = canonical['href'] if canonical else ""
                 
+                # Content
                 text_content = soup.get_text(separator=' ', strip=True)
                 page_data['word_count'] = len(text_content.split())
                 page_data['content_hash'] = get_page_hash(text_content)
                 page_data['page_text'] = text_content
                 
+                # Images
                 imgs = soup.find_all('img')
                 for img in imgs:
                     src = img.get('src')
@@ -158,10 +187,12 @@ def crawl_site(start_url, max_pages):
                             'alt': img.get('alt', '')
                         })
 
+                # Robots
                 robots_meta = soup.find('meta', attrs={'name': 'robots'})
                 if robots_meta and 'noindex' in robots_meta.get('content', '').lower():
                     page_data['indexable'] = False
 
+                # Links extraction
                 all_links = soup.find_all('a', href=True)
                 for link in all_links:
                     raw_link = link['href'].strip()
@@ -169,19 +200,22 @@ def crawl_site(start_url, max_pages):
                         continue
                     
                     abs_link = urljoin(url, raw_link)
-                    clean_link = abs_link.split('#')[0].rstrip('/')
+                    clean_link = normalize_url(abs_link)
                     
+                    # Check domain
                     link_parsed = urlparse(clean_link)
                     link_domain = link_parsed.netloc.replace('www.', '')
                     
                     if link_domain == base_domain:
                         page_data['links'].append(clean_link)
+                        # Add to queue if not visited
                         if clean_link not in visited and clean_link not in queue:
                             queue.append(clean_link)
                             
-            collection.update_one({"url": url}, {"$set": page_data}, upsert=True)
+            collection.update_one({"url": final_url}, {"$set": page_data}, upsert=True)
 
         except Exception as e:
+            # Log failure
             collection.update_one(
                 {"url": url},
                 {"$set": {"url": url, "status_code": 0, "error": str(e), "crawl_time": datetime.now()}},
@@ -196,6 +230,7 @@ def get_metrics():
     col = get_db_collection()
     if col is None: return None, None
     
+    # Optimized fetch
     data = list(col.find({}, {'_id': 0, 'page_text': 0}))
     df = pd.DataFrame(data)
     
@@ -267,7 +302,7 @@ def render_metric_card(label, value, df_subset, key_suffix):
                 display_df = df_subset[['url', 'status_code']].head(limit)
                 st.dataframe(display_df, use_container_width=True)
                 if len(df_subset) > limit:
-                    st.caption(f"Showing top {limit} of {len(df_subset)} records to maintain performance.")
+                    st.caption(f"Showing top {limit} of {len(df_subset)} records.")
 
 # --- SIDEBAR ---
 with st.sidebar:
@@ -287,7 +322,6 @@ with st.sidebar:
 
     st.markdown("---")
     
-    # --- INPUT FIELDS (Corrected) ---
     target_url = st.text_input("Target URL", "https://example.com")
     max_pages_limit = st.number_input("Max Pages", 10, 2000, 50)
     
@@ -345,100 +379,104 @@ with tab1:
     else:
         st.info("No crawl data found. Enter a URL in the sidebar and click 'Start Crawl'.")
 
-# --- SITE STRUCTURE (STRICT TREE) ---
+# --- SITE STRUCTURE (FIXED TREE VISUALIZATION) ---
 with tab2:
     if full_df is not None:
         st.subheader("Site Architecture")
-        st.info("Visualizing clear parent-child relationships (Hub & Spoke Tree).")
+        st.info("Visualizing site hierarchy (Top-Down Tree).")
         
         G = nx.DiGraph()
         
-        # Root Identification
-        root_url = target_url if target_url in full_df['url'].values else full_df['url'].iloc[0]
+        # 1. IDENTIFY ROOT
+        # Try to find the start_url in our crawled data
+        root_url = None
         
-        # BFS Traversal
-        queue = [root_url]
-        visited_in_tree = {root_url}
-        limit_nodes = 300
+        # Helper to find closest match in DB to the user input target
+        if target_url:
+            clean_target = normalize_url(target_url)
+            if clean_target in full_df['url'].values:
+                root_url = clean_target
         
-        # Add root
-        if not full_df[full_df['url'] == root_url].empty:
-            root_row = full_df[full_df['url'] == root_url].iloc[0]
+        # Fallback: Just take the first URL found (usually the start page)
+        if not root_url and not full_df.empty:
+            root_url = full_df['url'].iloc[0]
+
+        # 2. BUILD TREE (BFS)
+        if root_url:
+            queue = [root_url]
+            visited_in_tree = {root_url}
+            limit_nodes = 300 
+            
+            # Add Root Node
             G.add_node(root_url, label="Home", title=root_url, color="#0047AB", size=40)
-        
-        nodes_count = 1
-        
-        while queue and nodes_count < limit_nodes:
-            current_url = queue.pop(0)
             
-            current_row = full_df[full_df['url'] == current_url]
-            if current_row.empty: continue
-            links = current_row.iloc[0]['links']
+            nodes_count = 1
             
-            if isinstance(links, list):
-                for link in links:
-                    if link in full_df['url'].values and link not in visited_in_tree:
-                        visited_in_tree.add(link)
-                        queue.append(link)
-                        nodes_count += 1
-                        
-                        link_row = full_df[full_df['url'] == link].iloc[0]
-                        node_color = "#4A90E2"
-                        if 300 <= link_row['status_code'] < 400: node_color = "#F5A623"
-                        elif link_row['status_code'] >= 400: node_color = "#D0021B"
-                        
-                        path_label = urlparse(link).path
-                        if path_label in ['', '/']: path_label = "Home"
-                        else: path_label = path_label.split('/')[-1][:15]
-                        
-                        G.add_node(link, label=path_label, title=link, color=node_color, size=20)
-                        G.add_edge(current_url, link, color="#888888")
+            while queue and nodes_count < limit_nodes:
+                curr = queue.pop(0)
+                
+                # Get children
+                row = full_df[full_df['url'] == curr]
+                if row.empty: continue
+                
+                links = row.iloc[0]['links']
+                if isinstance(links, list):
+                    for link in links:
+                        # Only add if we crawled this link (it exists in our DB)
+                        # and we haven't already placed it in the tree
+                        if link in full_df['url'].values and link not in visited_in_tree:
+                            visited_in_tree.add(link)
+                            queue.append(link)
+                            nodes_count += 1
+                            
+                            # Node styling
+                            link_row = full_df[full_df['url'] == link].iloc[0]
+                            code = link_row['status_code']
+                            color = "#4A90E2" # Blue
+                            if code >= 400: color = "#D0021B" # Red
+                            elif 300 <= code < 400: color = "#F5A623" # Orange
+                            
+                            # Label formatting
+                            path = urlparse(link).path.strip("/")
+                            label = path[:15] + "..." if len(path) > 15 else path
+                            if not label: label = "Page"
+                            
+                            G.add_node(link, label=label, title=link, color=color, size=20)
+                            G.add_edge(curr, link, color="#999999")
 
-        if nodes_count >= limit_nodes:
-            st.warning(f"Tree limited to top {limit_nodes} pages for performance.")
-
-        # PyVis Configuration
-        net = Network(height='700px', width='100%', bgcolor='#ffffff', font_color='black', directed=True)
-        net.from_nx(G)
-        
-        options = {
-            "layout": {
-                "hierarchical": {
-                    "enabled": True,
-                    "direction": "UD", 
-                    "sortMethod": "directed",
-                    "nodeSpacing": 150,
-                    "levelSeparation": 150
-                }
-            },
-            "physics": {
-                "hierarchicalRepulsion": {
-                    "centralGravity": 0.0,
-                    "springLength": 100,
-                    "springConstant": 0.01,
-                    "nodeDistance": 120,
-                    "damping": 0.09
+            # 3. CONFIGURE PYVIS (HIERARCHICAL)
+            net = Network(height='700px', width='100%', bgcolor='#ffffff', font_color='black', directed=True)
+            net.from_nx(G)
+            
+            # Strict Tree Options
+            options = {
+                "layout": {
+                    "hierarchical": {
+                        "enabled": True,
+                        "direction": "UD", # Up-Down
+                        "sortMethod": "directed",
+                        "nodeSpacing": 180,
+                        "levelSeparation": 150
+                    }
                 },
-                "solver": "hierarchicalRepulsion"
-            },
-            "edges": {
-                "smooth": {
-                    "type": "cubicBezier",
-                    "forceDirection": "vertical",
-                    "roundness": 0.4
+                "physics": {
+                    "hierarchicalRepulsion": {
+                        "nodeDistance": 180
+                    }
                 },
-                "arrows": {
-                    "to": {"enabled": True, "scaleFactor": 1}
+                "edges": {
+                    "smooth": {"type": "cubicBezier", "forceDirection": "vertical", "roundness": 0.4},
+                    "arrows": {"to": {"enabled": True, "scaleFactor": 1}}
                 }
             }
-        }
-        
-        net.set_options(json.dumps(options))
-        
-        path = tempfile.gettempdir() + "/network.html"
-        net.save_graph(path)
-        with open(path, 'r', encoding='utf-8') as f:
-            st.components.v1.html(f.read(), height=700)
+            net.set_options(json.dumps(options))
+            
+            path = tempfile.gettempdir() + "/network.html"
+            net.save_graph(path)
+            with open(path, 'r', encoding='utf-8') as f:
+                st.components.v1.html(f.read(), height=700)
+        else:
+            st.warning("Could not identify a root node for the tree.")
     else:
         st.warning("Data needed for visualization.")
 
