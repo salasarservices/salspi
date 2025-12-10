@@ -169,7 +169,6 @@ def crawl_site(start_url, max_pages):
                 # Links
                 all_links = soup.find_all('a', href=True)
                 
-                # --- THIS IS THE SECTION THAT WAS FAILING ---
                 for link in all_links:
                     raw_link = link['href'].strip()
                     
@@ -318,35 +317,4 @@ with st.sidebar:
         crawl_site(target_url, max_pages_limit)
         st.rerun()
     
-    if st.button("🗑️ Clear Database"):
-        coll = get_db_collection()
-        if coll is not None:
-            coll.delete_many({})
-            st.success("Database Cleared")
-            time.sleep(1)
-            st.rerun()
-
-# --- MAIN LOGIC ---
-tab1, tab2, tab3 = st.tabs(["📊 Crawl Report", "🕸️ Site Structure", "🔍 Search"])
-
-# Safe Data Loading
-col = get_db_collection()
-has_data = False
-if col is not None:
-    try:
-        if col.count_documents({}, limit=1) > 0:
-            has_data = True
-    except Exception:
-        has_data = False
-
-if has_data:
-    metrics_data, full_df = get_metrics()
-else:
-    metrics_data, full_df = None, None
-
-with tab1:
-    if metrics_data:
-        st.subheader("Site Health Overview")
-        c1, c2, c3, c4 = st.columns(4)
-        with c1: render_metric_card("Total Pages", metrics_data['total_pages'], full_df, "tot")
-        with c2: render_
+    if st.button("🗑
