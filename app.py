@@ -98,8 +98,20 @@ with col_mid:
             st.info("Stop requested. Background thread will finish shortly.")
 
     # Refresh progress (manual)
-    if st.button("Refresh Progress"):
-        st.experimental_rerun()
+if st.button("Refresh Progress"):
+    # Try to call experimental_rerun() if available; otherwise use a safe fallback
+    rerun = getattr(st, "experimental_rerun", None)
+    if callable(rerun):
+        try:
+            rerun()
+        except Exception:
+            # Fallback: update query params to trigger a rerun
+            import time
+            st.experimental_set_query_params(_refresh=int(time.time()))
+    else:
+        # Fallback: update query params to trigger a rerun
+        import time
+        st.experimental_set_query_params(_refresh=int(time.time()))
 
 with col_right:
     # DB status
