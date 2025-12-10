@@ -1,306 +1,379 @@
 import streamlit as st
-import time
-import logging
 import pandas as pd
-from crawler import CrawlManager, crawl_site
-from seo_checks import compute_metrics
-from db import save_crawl, latest_crawl, delete_database, list_crawls, get_config, is_connected
-from graph_utils import draw_network_graph
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+import pymongo
+import networkx as nx
+from pyvis.network import Network
+import tempfile
+import time
+import hashlib
+from datetime import datetime
 
-st.set_page_config(page_title="SEO Crawler", layout="wide")
+# --- CONFIGURATION & STYLING ---
+st.set_page_config(page_title="SeoSpider Pro", page_icon="🕸️", layout="wide")
 
-# --- Helper: build DataFrame for metric display ---
-def build_metric_dataframe(crawl, metric_key, lists):
-    """
-    Build a pandas DataFrame for the selected metric_key using crawl + lists mapping.
-    DataFrame columns: URL, Title, Status, Notes (where applicable).
-    """
-    pages = crawl.get("pages", {}) if crawl else {}
-    rows = []
-
-    entries = lists.get(metric_key, [])
-    # entries might be strings like "page -> src" for image lists, or just URLs.
-    for e in entries:
-        if isinstance(e, dict):
-            # some lists might return dicts
-            page = e.get("page") or e.get("url") or ""
-            src = e.get("src") or ""
-            status = pages.get(page, {}).get("status_code") if page in pages else ""
-            title = pages.get(page, {}).get("title") if page in pages else ""
-            notes = src
-            rows.append({"URL": page, "Title": title, "Status": status, "Notes": notes})
-            continue
-
-        if isinstance(e, str) and "->" in e:
-            # pattern "page -> src"
-            try:
-                page_part, src_part = [p.strip() for p in e.split("->", 1)]
-            except Exception:
-                page_part = e
-                src_part = ""
-            page = page_part
-            status = pages.get(page, {}).get("status_code") if page in pages else ""
-            title = pages.get(page, {}).get("title") if page in pages else ""
-            rows.append({"URL": page, "Title": title, "Status": status, "Notes": src_part})
-            continue
-
-        # otherwise treat e as URL
-        page = e
-        status = pages.get(page, {}).get("status_code") if page in pages else ""
-        title = pages.get(page, {}).get("title") if page in pages else ""
-        rows.append({"URL": page, "Title": title, "Status": status, "Notes": ""})
-
-    if not rows:
-        return pd.DataFrame(columns=["URL", "Title", "Status", "Notes"])
-    df = pd.DataFrame(rows)
-    # Deduplicate rows by URL while preserving first occurrence
-    df = df.drop_duplicates(subset=["URL"], keep="first").reset_index(drop=True)
-    return df
-
-# --- UI: controls ---
-st.title("SEO Crawler & Analyzer")
-
-col_left, col_mid, col_right = st.columns([1, 1, 1])
-with col_left:
-    site = st.text_input("Site to crawl (include scheme)", value="https://example.com")
-    max_pages = st.number_input("Max pages", min_value=10, max_value=20000, value=500, step=10)
-    max_workers = st.number_input("Workers", min_value=1, max_value=50, value=8)
-with col_mid:
-    # Import the crawler runner (adjust import path if your package layout differs)
-try:
-    from salspi.crawler import start_crawl_thread  # preferred if app is a package
-except Exception:
-    from crawler import start_crawl_thread  # fallback for local import
-
-logger = logging.getLogger("salspi.app")
-
-# Ensure session_state keys for the form fields are present (adapt keys if yours differ)
-# If your UI uses different field names, replace these keys accordingly.
-start_url = st.session_state.get("start_url") or st.session_state.get("site_to_crawl")
-max_pages = int(st.session_state.get("max_pages", 500))
-workers = int(st.session_state.get("workers", 8))
-
-# Start Crawl
-if st.button("Start Crawl"):
-    # Read current values from session_state (or fallback to text inputs if you use them)
-    start_url = st.session_state.get("start_url") or st.session_state.get("site_to_crawl") or start_url
-    if not start_url:
-        st.error("Please enter the site to crawl (include scheme).")
-    else:
-        # Prevent launching multiple threads
-        thread_alive = False
-        thread_obj = st.session_state.get("crawl_thread")
-        if thread_obj is not None and getattr(thread_obj, "is_alive", lambda: False)():
-            thread_alive = True
-
-        if thread_alive:
-            st.info("Crawl already running")
-        else:
-            stop_event, thread = start_crawl_thread(
-                start_url=start_url,
-                max_pages=max_pages,
-                workers=workers,
-                progress_cb=None,   # supply a progress callback or db_writer if you have one
-                db_writer=None,     # or pass a lightweight db writer function
-            )
-            st.session_state.crawl_stop_event = stop_event
-            st.session_state.crawl_thread = thread
-            st.success("Crawl started in background. Use Refresh Progress to update status.")
-
-# Pause Crawl (optional behaviour)
-if st.button("Pause Crawl"):
-    # Simple behaviour: request stop; you can implement a dedicated pause flag instead
-    if st.session_state.get("crawl_stop_event"):
-        st.session_state.crawl_stop_event.set()
-        st.info("Pause/stop requested; workers will exit. Restart to resume.")
-    else:
-        st.info("No crawl in progress to pause.")
-
-# Stop Crawl
-if st.button("Stop Crawl"):
-    if st.session_state.get("crawl_stop_event"):
-        st.session_state.crawl_stop_event.set()
-        st.info("Stop requested; workers will exit soon.")
-    else:
-        st.info("No crawl in progress.")
-
-# Refresh Progress (safe fallback if experimental_rerun is missing)
-if st.button("Refresh Progress"):
-    rerun = getattr(st, "experimental_rerun", None)
-    if callable(rerun):
-        try:
-            rerun()
-        except Exception:
-            # fallback: update query params to force a rerun without crashing
-            st.experimental_set_query_params(_refresh=int(time.time()))
-    else:
-        st.experimental_set_query_params(_refresh=int(time.time()))
-# ---- END REPLACE BLOCK ----
-with col_right:
-    # DB status
-    cfg = get_config()
-    if is_connected():
-        st.success("Connected to MongoDB")
-        host = (cfg.get("uri") or "").split("@")[-1] if cfg.get("uri") else ""
-        st.write("Host:", host)
-        st.write("DB:", cfg.get("db"))
-    else:
-        st.warning("MongoDB unreachable — using local fallback.")
-
-st.markdown("---")
-
-# --- Progress area (visible and updateable) ---
-manager = st.session_state.get("crawler_manager")
-if manager:
-    prog = manager.get_progress()
-    pages_crawled = prog["pages_crawled"]
-    discovered = prog["discovered"]
-    max_pages_cfg = prog["max_pages"]
-    finished = prog["finished"]
-    error = prog["error"]
-
-    st.subheader("Crawl Progress")
-    progress_placeholder = st.empty()
-    # Display a numeric + progress bar area
-    with progress_placeholder.container():
-        denom = max(1, max_pages_cfg)
-        fraction = min(1.0, pages_crawled / denom)
-        pct = int(fraction * 100)
-        st.progress(pct)
-        st.markdown(f"Pages crawled: **{pages_crawled}** / **{max_pages_cfg}** — Discovered URLs: **{discovered}**")
-        if manager.is_paused():
-            st.info("Status: Paused")
-        elif manager.is_running():
-            st.info("Status: Running")
-        elif finished:
-            st.success("Status: Finished")
-        if error:
-            st.error(f"Error: {error}")
-
-    # Option: auto-refresh while running
-    auto_refresh = st.checkbox("Auto-refresh progress (every 2s)", value=False)
-    if auto_refresh and manager.is_running():
-        # Try to use streamlit_autorefresh if available; otherwise simple rerun loop
-        try:
-            from streamlit_autorefresh import st_autorefresh
-            # st_autorefresh returns an integer count; requesting reruns at interval_ms
-            st_autorefresh(interval=2000, key="auto_refresh")
-        except Exception:
-            # Best-effort fallback: short sleep then rerun (non-blocking user interactions will still be limited)
-            time.sleep(2)
-            st.experimental_rerun()
-
-    # When finished, allow saving results to DB and view metrics
-    if finished and manager.get_result():
-        crawl = manager.get_result()
-        st.write("Crawl completed. You can save it to DB or view metrics.")
-        if st.button("Save Crawl to DB"):
-            saved_id = save_crawl(site, crawl)
-            st.success(f"Crawl saved: {saved_id}")
-        if st.button("View Metrics for Last Crawl"):
-            metrics, lists = compute_metrics(crawl)
-            st.experimental_set_query_params()  # small no-op to trigger UI stability
-            st.json(metrics)
-
-else:
-    st.info("No crawl in progress. Click 'Start Crawl' to begin.")
-
-st.markdown("---")
-
-# --- Metrics tiles & selectable listing ---
-# Load latest crawl snapshot either from session manager result or from stored last crawl
-crawl = None
-if manager and manager.get_result():
-    crawl = manager.get_result()
-else:
-    crawl = st.session_state.get("last_crawl")
-
-if crawl:
-    metrics, lists = compute_metrics(crawl)
-
-    # Metric keys and labels
-    metric_keys = [
-        ("total_pages", "Total Pages"),
-        ("duplicate_pages", "Duplicate Pages"),
-        ("duplicate_meta_titles", "Duplicate Meta Titles"),
-        ("duplicate_meta_descriptions", "Duplicate Meta Descriptions"),
-        ("canonical_issues", "Canonical Issues"),
-        ("images_missing_alt", "Images Missing Alt"),
-        ("images_duplicate_alt", "Images Duplicate Alt"),
-        ("pages_with_broken_links", "Pages with Broken Links"),
-        ("pages_with_300_responses", "Pages with 300 Responses"),
-        ("pages_with_400_responses", "Pages with 400 Responses"),
-        ("pages_with_500_responses", "Pages with 500 Responses"),
-        ("indexable_pages", "Indexable Pages"),
-        ("non_indexable_pages", "Non-indexable Pages"),
-    ]
-
-    st.subheader("Metrics")
-    cols = st.columns(3)
-    i = 0
-    for key, label in metric_keys:
-        c = cols[i % 3]
-        with c:
-            val = metrics.get(key, 0)
-            # Button to select metric; will set selected_metric in session_state
-            if st.button(f"{label} — {val}", key=f"btn_{key}"):
-                st.session_state["selected_metric"] = key
-            # Display as a subtle tile
-            st.markdown(f"<div style='background:#f5f7fb; padding:12px; border-radius:8px; text-align:center'>"
-                        f"<div style='font-size:14px; color:#333;'>{label}</div>"
-                        f"<div style='font-weight:700; font-size:22px; color:#111'>{val}</div></div>",
-                        unsafe_allow_html=True)
-        i += 1
-
-    # Show selected list in an excel-like scrollable table
-    sel = st.session_state.get("selected_metric")
-    if sel:
-        st.subheader(f"URLs for metric: {sel}")
-        items_df = build_metric_dataframe(crawl, sel, lists)
-        st.write(f"Total rows: {len(items_df)}")
-        # Excel-like, scrollable display using st.dataframe with a fixed height
-        st.dataframe(items_df, height=360)  # user can scroll inside the frame
-
-    # Option to render site structure graph
-    st.header("Site Structure")
-    try:
-        draw_network_graph(crawl)
-    except Exception as e:
-        st.error(f"Could not render graph: {e}")
-
-else:
-    st.info("No crawl data available. Start a crawl or load the latest crawl from DB.")
-
-st.markdown("---")
-# --- Search Site ---
-st.header("Search Site (from last crawl)")
-if st.button("Load Latest Crawl From DB"):
-    doc = latest_crawl(site)
-    if doc:
-        # doc may be a dict with "crawl" key (from Mongo) or the raw crawl (from local fallback)
-        if isinstance(doc, dict) and "crawl" in doc:
-            st.session_state["last_crawl"] = doc["crawl"]
-        else:
-            st.session_state["last_crawl"] = doc
-        st.success("Loaded latest crawl from DB (or local fallback).")
-    else:
-        st.warning("No saved crawl found for this site.")
-
-crawl_loaded = st.session_state.get("last_crawl")
-if crawl_loaded:
-    query = st.text_input("Search for a word or phrase")
-    if st.button("Search"):
-        results = []
-        for url, p in crawl_loaded["pages"].items():
-            txt = (p.get("content_text") or "").lower()
-            if query.strip().lower() in txt:
-                results.append({"URL": url, "Title": p.get("title", ""), "Status": p.get("status_code", "")})
-        df_res = pd.DataFrame(results)
-        st.dataframe(df_res, height=360)
-
+# Custom CSS for Pastel Colors and Minimalist UI
 st.markdown("""
-Notes:
-- Click a metric tile to view the affected URLs in an excel-like scrollable table.
-- Use 'Auto-refresh progress' to keep the progress bar updating automatically (requires the optional streamlit-autorefresh package; otherwise use 'Refresh Progress').
-- When a crawl is running, use Pause / Resume / Stop controls to manage it.
-""")
+<style>
+    .metric-card {
+        background-color: #F0F2F6;
+        border-radius: 10px;
+        padding: 20px;
+        text-align: center;
+        margin-bottom: 10px;
+        border: 1px solid #E0E0E0;
+    }
+    .metric-value {
+        font-size: 32px;
+        font-weight: bold;
+        color: #4A90E2; /* Pastel Blue */
+    }
+    .metric-label {
+        font-size: 14px;
+        color: #666;
+    }
+    .stButton>button {
+        width: 100%;
+        border-radius: 5px;
+    }
+    /* Status Code Colors */
+    .status-200 { color: #77DD77; font-weight: bold; } /* Pastel Green */
+    .status-300 { color: #FFB347; font-weight: bold; } /* Pastel Orange */
+    .status-400 { color: #FF6961; font-weight: bold; } /* Pastel Red */
+    .status-500 { color: #B19CD9; font-weight: bold; } /* Pastel Purple */
+</style>
+""", unsafe_allow_html=True)
+
+# --- MONGODB CONNECTION ---
+# Replace with your actual connection string or use st.secrets
+# Example: "mongodb+srv://<user>:<password>@cluster0.mongodb.net/?retryWrites=true&w=majority"
+MONGO_URI = st.sidebar.text_input("MongoDB Connection URI", value="mongodb://localhost:27017/", type="password")
+DB_NAME = "seo_crawler_db"
+COLLECTION_NAME = "crawled_pages"
+
+def get_db_collection():
+    try:
+        client = pymongo.MongoClient(MONGO_URI)
+        db = client[DB_NAME]
+        return db[COLLECTION_NAME]
+    except Exception as e:
+        st.sidebar.error(f"DB Connection Error: {e}")
+        return None
+
+# --- CRAWLER ENGINE ---
+def get_page_hash(content):
+    """Generate MD5 hash of content to check for duplicates"""
+    return hashlib.md5(content.encode('utf-8')).hexdigest()
+
+def crawl_site(start_url, max_pages):
+    collection = get_db_collection()
+    if collection is None: return
+    
+    # Reset DB for new crawl
+    collection.delete_many({})
+    
+    domain = urlparse(start_url).netloc
+    queue = [start_url]
+    visited = set()
+    count = 0
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    while queue and count < max_pages:
+        url = queue.pop(0)
+        if url in visited: continue
+        
+        visited.add(url)
+        count += 1
+        
+        # UI Update
+        progress_bar.progress(count / max_pages)
+        status_text.text(f"Crawling: {url}")
+        
+        try:
+            start_time = time.time()
+            response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+            latency = (time.time() - start_time) * 1000 # ms
+            
+            page_data = {
+                "url": url,
+                "status_code": response.status_code,
+                "content_type": response.headers.get('Content-Type', ''),
+                "crawl_time": datetime.now(),
+                "latency_ms": latency,
+                "links": [],
+                "images": [],
+                "h1": [],
+                "h2": [],
+                "title": "",
+                "meta_desc": "",
+                "canonical": "",
+                "word_count": 0,
+                "content_hash": "",
+                "indexable": True
+            }
+
+            if response.status_code == 200 and 'text/html' in page_data['content_type']:
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # Metadata
+                page_data['title'] = soup.title.string if soup.title else ""
+                meta_desc = soup.find('meta', attrs={'name': 'description'})
+                page_data['meta_desc'] = meta_desc['content'] if meta_desc else ""
+                canonical = soup.find('link', rel='canonical')
+                page_data['canonical'] = canonical['href'] if canonical else ""
+                
+                # Headings
+                page_data['h1'] = [h.get_text(strip=True) for h in soup.find_all('h1')]
+                page_data['h2'] = [h.get_text(strip=True) for h in soup.find_all('h2')]
+                
+                # Content & Duplicate Check
+                text_content = soup.get_text(separator=' ', strip=True)
+                page_data['word_count'] = len(text_content.split())
+                page_data['content_hash'] = get_page_hash(text_content)
+                page_data['page_text'] = text_content # Storing full text for search
+
+                # Images
+                imgs = soup.find_all('img')
+                for img in imgs:
+                    page_data['images'].append({
+                        'src': img.get('src'),
+                        'alt': img.get('alt', '')
+                    })
+
+                # Robots / Indexability (Simplified)
+                robots_meta = soup.find('meta', attrs={'name': 'robots'})
+                if robots_meta and 'noindex' in robots_meta.get('content', '').lower():
+                    page_data['indexable'] = False
+
+                # Extract Links for recursion and structure
+                for link in soup.find_all('a', href=True):
+                    abs_link = urljoin(url, link['href'])
+                    # Normalize
+                    abs_link = abs_link.split('#')[0].rstrip('/')
+                    
+                    if urlparse(abs_link).netloc == domain:
+                        page_data['links'].append(abs_link)
+                        if abs_link not in visited and abs_link not in queue:
+                            queue.append(abs_link)
+                            
+            # Insert into Mongo
+            collection.insert_one(page_data)
+
+        except Exception as e:
+            # Log failed pages
+            collection.insert_one({
+                "url": url,
+                "status_code": 0, # Error
+                "error": str(e)
+            })
+
+    progress_bar.progress(100)
+    status_text.success("Crawl Complete!")
+
+# --- ANALYZER ---
+def get_metrics():
+    col = get_db_collection()
+    if col is None: return None
+    
+    df = pd.DataFrame(list(col.find({}, {'_id': 0})))
+    if df.empty: return None
+    
+    metrics = {}
+    
+    # 1.1 Total Pages
+    metrics['total_pages'] = len(df)
+    
+    # 1.2 Duplicate Content Pages
+    if 'content_hash' in df.columns:
+        metrics['duplicate_content'] = df[df.duplicated(subset=['content_hash'], keep=False) & (df['content_hash'] != "")]
+    else:
+        metrics['duplicate_content'] = pd.DataFrame()
+
+    # 1.3 Duplicate Titles
+    metrics['duplicate_titles'] = df[df.duplicated(subset=['title'], keep=False) & (df['title'] != "")]
+    
+    # 1.4 Duplicate Descriptions
+    metrics['duplicate_desc'] = df[df.duplicated(subset=['meta_desc'], keep=False) & (df['meta_desc'] != "")]
+    
+    # 1.5 Canonical Issues (Self-referencing mismatch or missing)
+    # Simplified logic: If canonical exists but doesn't match URL
+    def check_canonical(row):
+        return row['canonical'] and row['canonical'] != row['url']
+    metrics['canonical_issues'] = df[df.apply(check_canonical, axis=1)] if 'canonical' in df.columns else pd.DataFrame()
+    
+    # 1.6 Images Missing Alt
+    missing_alt_urls = []
+    if 'images' in df.columns:
+        for idx, row in df.iterrows():
+            if isinstance(row['images'], list):
+                for img in row['images']:
+                    if not img.get('alt'):
+                        missing_alt_urls.append(row['url'])
+                        break
+    metrics['missing_alt'] = df[df['url'].isin(missing_alt_urls)]
+
+    # 1.7 Broken Links (Based on 404s found during crawl)
+    # Note: To find broken OUTBOUND links requires deeper parsing, here we count broken INTERNAL pages found.
+    metrics['broken_pages'] = df[df['status_code'] == 404]
+
+    # 1.8 - 1.10 Status Codes
+    metrics['status_3xx'] = df[(df['status_code'] >= 300) & (df['status_code'] < 400)]
+    metrics['status_4xx'] = df[(df['status_code'] >= 400) & (df['status_code'] < 500)]
+    metrics['status_5xx'] = df[df['status_code'] >= 500]
+
+    # 1.11 - 1.12 Indexability
+    metrics['indexable'] = df[df['indexable'] == True]
+    metrics['non_indexable'] = df[df['indexable'] == False]
+
+    # 1.15 PageSpeed (Mocked for Demo - requires API)
+    # We use latency as a proxy
+    metrics['slow_pages'] = df[df['latency_ms'] > 2000] # Pages taking > 2s
+
+    return metrics, df
+
+# --- VISUALIZER ---
+def generate_network_graph(df):
+    G = nx.DiGraph()
+    
+    for _, row in df.iterrows():
+        G.add_node(row['url'], title=row['title'], group=row['status_code'])
+        if isinstance(row['links'], list):
+            for link in row['links']:
+                # Only add edge if target also in df (internal linking structure)
+                if link in df['url'].values:
+                    G.add_edge(row['url'], link)
+    
+    return G
+
+# --- UI COMPONENTS ---
+def render_metric_card(label, value, df_subset, key_suffix):
+    """Renders a metric that can be expanded to show details"""
+    with st.container():
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-value">{value}</div>
+            <div class="metric-label">{label}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        if value > 0:
+            with st.expander(f"View {label} Details"):
+                st.dataframe(df_subset[['url', 'title', 'status_code']], use_container_width=True)
+
+# --- MAIN APP FLOW ---
+
+# Sidebar Controls
+with st.sidebar:
+    st.header("🎮 Control Panel")
+    target_url = st.text_input("Website URL", "https://example.com")
+    max_pages_limit = st.number_input("Max Pages", 10, 2000, 50)
+    
+    col1, col2 = st.columns(2)
+    if col1.button("Start Crawl", type="primary"):
+        crawl_site(target_url, max_pages_limit)
+        st.rerun()
+    
+    if col2.button("Delete DB"):
+        coll = get_db_collection()
+        if coll is not None:
+            coll.drop()
+            st.success("Database Cleared")
+            st.rerun()
+
+# Main Tabs
+tab1, tab2, tab3 = st.tabs(["📊 Crawl Report", "🕸️ Site Structure", "🔍 Search Site"])
+
+# Calculate Metrics if DB has data
+metrics_data, full_df = get_metrics() if get_db_collection().count_documents({}) > 0 else (None, None)
+
+with tab1:
+    if metrics_data:
+        st.subheader("Site Health Overview")
+        
+        # Row 1: High Level
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: render_metric_card("Total Pages", metrics_data['total_pages'], full_df, "tot")
+        with c2: render_metric_card("Indexable Pages", len(metrics_data['indexable']), metrics_data['indexable'], "idx")
+        with c3: render_metric_card("Non-Indexable", len(metrics_data['non_indexable']), metrics_data['non_indexable'], "nidx")
+        with c4: render_metric_card("Slow Pages (>2s)", len(metrics_data['slow_pages']), metrics_data['slow_pages'], "slow")
+
+        st.markdown("---")
+        st.subheader("Content & Metadata Issues")
+        
+        # Row 2: Content Issues
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: render_metric_card("Duplicate Content", len(metrics_data['duplicate_content']), metrics_data['duplicate_content'], "dup_cont")
+        with c2: render_metric_card("Duplicate Titles", len(metrics_data['duplicate_titles']), metrics_data['duplicate_titles'], "dup_tit")
+        with c3: render_metric_card("Duplicate Desc", len(metrics_data['duplicate_desc']), metrics_data['duplicate_desc'], "dup_desc")
+        with c4: render_metric_card("Canonical Issues", len(metrics_data['canonical_issues']), metrics_data['canonical_issues'], "canon")
+
+        # Row 3: Technical & Images
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: render_metric_card("Missing Alt Tags", len(metrics_data['missing_alt']), metrics_data['missing_alt'], "alt")
+        with c2: render_metric_card("3xx Redirection", len(metrics_data['status_3xx']), metrics_data['status_3xx'], "3xx")
+        with c3: render_metric_card("4xx Client Errors", len(metrics_data['status_4xx']), metrics_data['status_4xx'], "4xx")
+        with c4: render_metric_card("5xx Server Errors", len(metrics_data['status_5xx']), metrics_data['status_5xx'], "5xx")
+        
+        st.markdown("---")
+        st.info("Note: 'URL Inspection' and full 'PageSpeed' metrics require Google API keys. Basic latency and structural checks are included above.")
+
+    else:
+        st.info("No data found. Please enter a URL and start crawling.")
+
+with tab2:
+    if full_df is not None:
+        st.subheader("Interactive Site Architecture")
+        st.caption("Visualizing internal link structure. Zoom and drag nodes.")
+        
+        # Create Graph
+        G = generate_network_graph(full_df)
+        
+        # Initiate PyVis
+        net = Network(height='600px', width='100%', bgcolor='#222222', font_color='white')
+        net.from_nx(G)
+        
+        # Physics options for stability
+        net.toggle_physics(True)
+        
+        # Save and display
+        try:
+            path = tempfile.gettempdir() + "/network.html"
+            net.save_graph(path)
+            with open(path, 'r', encoding='utf-8') as f:
+                source_code = f.read()
+            st.components.v1.html(source_code, height=600)
+        except Exception as e:
+            st.error(f"Error generating graph: {e}")
+    else:
+        st.warning("Crawl the site first to visualize structure.")
+
+with tab3:
+    st.subheader("Global Search")
+    search_query = st.text_input("Search for words or phrases across the entire site")
+    
+    if search_query and get_db_collection() is not None:
+        col = get_db_collection()
+        # MongoDB Text Search (requires text index, but we will use Regex for simplicity in this demo)
+        # For production: col.create_index([("page_text", "text")])
+        
+        results = list(col.find(
+            {"page_text": {"$regex": search_query, "$options": "i"}},
+            {"url": 1, "title": 1, "page_text": 1}
+        ))
+        
+        st.markdown(f"**Found {len(results)} pages matching '{search_query}'**")
+        
+        for res in results:
+            with st.expander(f"📄 {res.get('title', 'No Title')} ({res['url']})"):
+                # snippet extraction
+                text = res['page_text']
+                idx = text.lower().find(search_query.lower())
+                start = max(0, idx - 50)
+                end = min(len(text), idx + len(search_query) + 50)
+                snippet = text[start:end]
+                st.markdown(f"...**{snippet}**...")
+                st.write(f"[Open Link]({res['url']})")
