@@ -104,7 +104,7 @@ def get_db_collection():
             return None
     return None
 
-# --- CRAWLER ENGINE ---
+# --- CRAWLER ENGINE (FIXED) ---
 def get_page_hash(content):
     return hashlib.md5(content.encode('utf-8')).hexdigest()
 
@@ -114,7 +114,11 @@ def crawl_site(start_url, max_pages):
         st.error("Database unavailable. Please check server logs.")
         return
     
-    domain = urlparse(start_url).netloc
+    # 1. Normalize Base Domain (Ignore www)
+    parsed_start = urlparse(start_url)
+    base_domain = parsed_start.netloc.replace('www.', '')
+    
+    # Initialize Queue
     queue = [start_url]
     visited = set()
     count = 0
@@ -124,22 +128,28 @@ def crawl_site(start_url, max_pages):
     
     while queue and count < max_pages:
         url = queue.pop(0)
-        if url in visited: continue
         
+        # Normalize URL to avoid crawling https://site.com/page/ vs https://site.com/page
+        url = url.split('#')[0].rstrip('/')
+        
+        if url in visited: continue
         visited.add(url)
         count += 1
         
         progress_bar.progress(count / max_pages)
-        status_text.text(f"Crawling: {url}")
+        status_text.text(f"Crawling ({count}/{max_pages}): {url}")
         
         try:
+            # Add a small delay to be polite and avoid blocking
+            time.sleep(0.1)
+            
             start_time = time.time()
-            response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+            response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}, timeout=15)
             latency = (time.time() - start_time) * 1000
             
             page_data = {
                 "url": url,
-                "domain": domain,
+                "domain": base_domain,
                 "status_code": response.status_code,
                 "content_type": response.headers.get('Content-Type', ''),
                 "crawl_time": datetime.now(),
@@ -159,9 +169,9 @@ def crawl_site(start_url, max_pages):
                 soup = BeautifulSoup(response.text, 'html.parser')
                 
                 # Metadata
-                page_data['title'] = soup.title.string if soup.title else ""
+                page_data['title'] = soup.title.string.strip() if soup.title and soup.title.string else ""
                 meta_desc = soup.find('meta', attrs={'name': 'description'})
-                page_data['meta_desc'] = meta_desc['content'] if meta_desc else ""
+                page_data['meta_desc'] = meta_desc['content'].strip() if meta_desc and meta_desc.get('content') else ""
                 canonical = soup.find('link', rel='canonical')
                 page_data['canonical'] = canonical['href'] if canonical else ""
                 
@@ -174,35 +184,54 @@ def crawl_site(start_url, max_pages):
                 # Images
                 imgs = soup.find_all('img')
                 for img in imgs:
-                    page_data['images'].append({
-                        'src': img.get('src'),
-                        'alt': img.get('alt', '')
-                    })
+                    src = img.get('src')
+                    if src:
+                        page_data['images'].append({
+                            'src': urljoin(url, src),
+                            'alt': img.get('alt', '')
+                        })
 
-                # Indexability
+                # Indexability check
                 robots_meta = soup.find('meta', attrs={'name': 'robots'})
                 if robots_meta and 'noindex' in robots_meta.get('content', '').lower():
                     page_data['indexable'] = False
 
-                # Links
-                for link in soup.find_all('a', href=True):
-                    abs_link = urljoin(url, link['href'])
-                    abs_link = abs_link.split('#')[0].rstrip('/')
+                # --- IMPROVED LINK EXTRACTION ---
+                # Check if page is empty (Potential JavaScript Site)
+                all_links = soup.find_all('a', href=True)
+                if len(all_links) == 0:
+                    print(f"WARNING: No links found on {url}. Site might be JavaScript/SPA.")
+
+                for link in all_links:
+                    raw_link = link['href'].strip()
                     
-                    if urlparse(abs_link).netloc == domain:
-                        page_data['links'].append(abs_link)
-                        if abs_link not in visited and abs_link not in queue:
-                            queue.append(abs_link)
+                    # Skip useless links
+                    if not raw_link or raw_link.startswith(('mailto:', 'tel:', 'javascript:', '#')):
+                        continue
+                    
+                    # Create absolute link
+                    abs_link = urljoin(url, raw_link)
+                    
+                    # Normalize Link (strip trailing slash)
+                    clean_link = abs_link.split('#')[0].rstrip('/')
+                    
+                    # Parse Domain of the link
+                    link_parsed = urlparse(clean_link)
+                    link_domain = link_parsed.netloc.replace('www.', '')
+                    
+                    # Check if Internal Link (Matches Base Domain)
+                    if link_domain == base_domain:
+                        page_data['links'].append(clean_link)
+                        
+                        # Add to queue if new
+                        if clean_link not in visited and clean_link not in queue:
+                            queue.append(clean_link)
                             
-            # Upsert into Mongo
-            collection.update_one(
-                {"url": url}, 
-                {"$set": page_data}, 
-                upsert=True
-            )
+            # Save to Mongo
+            collection.update_one({"url": url}, {"$set": page_data}, upsert=True)
 
         except Exception as e:
-            # Log error
+            print(f"Error crawling {url}: {e}")
             collection.update_one(
                 {"url": url},
                 {"$set": {"url": url, "status_code": 0, "error": str(e), "crawl_time": datetime.now()}},
@@ -210,7 +239,7 @@ def crawl_site(start_url, max_pages):
             )
 
     progress_bar.progress(100)
-    status_text.success("Crawl Complete!")
+    status_text.success(f"Crawl Complete! Visited {count} pages.")
 
 # --- ANALYZER ---
 def get_metrics():
