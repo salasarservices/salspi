@@ -9,6 +9,8 @@ from pyvis.network import Network
 import tempfile
 import time
 import hashlib
+import os
+import json
 from datetime import datetime
 
 # --- CONFIGURATION & STYLING ---
@@ -38,41 +40,70 @@ st.markdown("""
         width: 100%;
         border-radius: 5px;
     }
-    /* Status Code Colors */
-    .status-200 { color: #77DD77; font-weight: bold; } /* Pastel Green */
-    .status-300 { color: #FFB347; font-weight: bold; } /* Pastel Orange */
-    .status-400 { color: #FF6961; font-weight: bold; } /* Pastel Red */
-    .status-500 { color: #B19CD9; font-weight: bold; } /* Pastel Purple */
 </style>
 """, unsafe_allow_html=True)
 
+# --- GOOGLE AUTHENTICATION SETUP ---
+def setup_google_auth():
+    """
+    Reads the Google credentials from Streamlit secrets, writes them to a 
+    temporary file, and sets the GOOGLE_APPLICATION_CREDENTIALS environment variable.
+    """
+    if "google" in st.secrets and "credentials" in st.secrets["google"]:
+        try:
+            # Create a temporary file (that persists during the session)
+            # We use delete=False so we can pass the path to the env var
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                f.write(st.secrets["google"]["credentials"])
+                temp_cred_path = f.name
+            
+            # Set the environment variable
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_cred_path
+            return True
+        except Exception as e:
+            st.error(f"Error setting up Google Auth: {e}")
+            return False
+    return False
+
+# Initialize Auth on App Start
+google_auth_status = setup_google_auth()
+
 # --- MONGODB CONNECTION ---
-# Replace with your actual connection string or use st.secrets
-# Example: "mongodb+srv://<user>:<password>@cluster0.mongodb.net/?retryWrites=true&w=majority"
-MONGO_URI = st.sidebar.text_input("MongoDB Connection URI", value="mongodb://localhost:27017/", type="password")
-DB_NAME = "seo_crawler_db"
-COLLECTION_NAME = "crawled_pages"
+@st.cache_resource
+def init_mongo_connection():
+    """
+    Connects to MongoDB using credentials from st.secrets.
+    Uses @st.cache_resource to maintain the connection object.
+    """
+    try:
+        uri = st.secrets["mongo"]["uri"]
+        client = pymongo.MongoClient(uri)
+        return client
+    except Exception as e:
+        st.error(f"Could not connect to MongoDB: {e}")
+        return None
 
 def get_db_collection():
-    try:
-        client = pymongo.MongoClient(MONGO_URI)
-        db = client[DB_NAME]
-        return db[COLLECTION_NAME]
-    except Exception as e:
-        st.sidebar.error(f"DB Connection Error: {e}")
-        return None
+    client = init_mongo_connection()
+    if client:
+        db_name = st.secrets["mongo"]["db"]
+        coll_name = st.secrets["mongo"]["collection"]
+        db = client[db_name]
+        return db[coll_name]
+    return None
 
 # --- CRAWLER ENGINE ---
 def get_page_hash(content):
-    """Generate MD5 hash of content to check for duplicates"""
     return hashlib.md5(content.encode('utf-8')).hexdigest()
 
 def crawl_site(start_url, max_pages):
     collection = get_db_collection()
-    if collection is None: return
+    if collection is None:
+        st.error("Database connection failed. Check secrets.")
+        return
     
-    # Reset DB for new crawl
-    collection.delete_many({})
+    # Clean previous crawl for this specific domain (optional, depends on use case)
+    # collection.delete_many({}) 
     
     domain = urlparse(start_url).netloc
     queue = [start_url]
@@ -89,17 +120,17 @@ def crawl_site(start_url, max_pages):
         visited.add(url)
         count += 1
         
-        # UI Update
         progress_bar.progress(count / max_pages)
         status_text.text(f"Crawling: {url}")
         
         try:
             start_time = time.time()
             response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
-            latency = (time.time() - start_time) * 1000 # ms
+            latency = (time.time() - start_time) * 1000
             
             page_data = {
                 "url": url,
+                "domain": domain,
                 "status_code": response.status_code,
                 "content_type": response.headers.get('Content-Type', ''),
                 "crawl_time": datetime.now(),
@@ -113,7 +144,8 @@ def crawl_site(start_url, max_pages):
                 "canonical": "",
                 "word_count": 0,
                 "content_hash": "",
-                "indexable": True
+                "indexable": True,
+                "page_text": ""
             }
 
             if response.status_code == 200 and 'text/html' in page_data['content_type']:
@@ -126,15 +158,15 @@ def crawl_site(start_url, max_pages):
                 canonical = soup.find('link', rel='canonical')
                 page_data['canonical'] = canonical['href'] if canonical else ""
                 
-                # Headings
-                page_data['h1'] = [h.get_text(strip=True) for h in soup.find_all('h1')]
-                page_data['h2'] = [h.get_text(strip=True) for h in soup.find_all('h2')]
-                
-                # Content & Duplicate Check
+                # Content
                 text_content = soup.get_text(separator=' ', strip=True)
                 page_data['word_count'] = len(text_content.split())
                 page_data['content_hash'] = get_page_hash(text_content)
-                page_data['page_text'] = text_content # Storing full text for search
+                page_data['page_text'] = text_content
+                
+                # Headings
+                page_data['h1'] = [h.get_text(strip=True) for h in soup.find_all('h1')]
+                page_data['h2'] = [h.get_text(strip=True) for h in soup.find_all('h2')]
 
                 # Images
                 imgs = soup.find_all('img')
@@ -144,15 +176,14 @@ def crawl_site(start_url, max_pages):
                         'alt': img.get('alt', '')
                     })
 
-                # Robots / Indexability (Simplified)
+                # Robots / Indexability
                 robots_meta = soup.find('meta', attrs={'name': 'robots'})
                 if robots_meta and 'noindex' in robots_meta.get('content', '').lower():
                     page_data['indexable'] = False
 
-                # Extract Links for recursion and structure
+                # Extract Links
                 for link in soup.find_all('a', href=True):
                     abs_link = urljoin(url, link['href'])
-                    # Normalize
                     abs_link = abs_link.split('#')[0].rstrip('/')
                     
                     if urlparse(abs_link).netloc == domain:
@@ -160,16 +191,20 @@ def crawl_site(start_url, max_pages):
                         if abs_link not in visited and abs_link not in queue:
                             queue.append(abs_link)
                             
-            # Insert into Mongo
-            collection.insert_one(page_data)
+            # Upsert into Mongo (Update if exists, Insert if new)
+            collection.update_one(
+                {"url": url}, 
+                {"$set": page_data}, 
+                upsert=True
+            )
 
         except Exception as e:
-            # Log failed pages
-            collection.insert_one({
-                "url": url,
-                "status_code": 0, # Error
-                "error": str(e)
-            })
+            # Log error
+            collection.update_one(
+                {"url": url},
+                {"$set": {"url": url, "status_code": 0, "error": str(e), "crawl_time": datetime.now()}},
+                upsert=True
+            )
 
     progress_bar.progress(100)
     status_text.success("Crawl Complete!")
@@ -179,33 +214,31 @@ def get_metrics():
     col = get_db_collection()
     if col is None: return None
     
+    # Fetch all data for analysis
     df = pd.DataFrame(list(col.find({}, {'_id': 0})))
     if df.empty: return None
     
     metrics = {}
     
-    # 1.1 Total Pages
+    # 1. Basic Counts
     metrics['total_pages'] = len(df)
     
-    # 1.2 Duplicate Content Pages
+    # 2. Duplicate Content
     if 'content_hash' in df.columns:
         metrics['duplicate_content'] = df[df.duplicated(subset=['content_hash'], keep=False) & (df['content_hash'] != "")]
     else:
         metrics['duplicate_content'] = pd.DataFrame()
 
-    # 1.3 Duplicate Titles
+    # 3. Duplicate Metadata
     metrics['duplicate_titles'] = df[df.duplicated(subset=['title'], keep=False) & (df['title'] != "")]
-    
-    # 1.4 Duplicate Descriptions
     metrics['duplicate_desc'] = df[df.duplicated(subset=['meta_desc'], keep=False) & (df['meta_desc'] != "")]
     
-    # 1.5 Canonical Issues (Self-referencing mismatch or missing)
-    # Simplified logic: If canonical exists but doesn't match URL
+    # 4. Canonical Issues
     def check_canonical(row):
         return row['canonical'] and row['canonical'] != row['url']
     metrics['canonical_issues'] = df[df.apply(check_canonical, axis=1)] if 'canonical' in df.columns else pd.DataFrame()
     
-    # 1.6 Images Missing Alt
+    # 5. Missing Alt Tags
     missing_alt_urls = []
     if 'images' in df.columns:
         for idx, row in df.iterrows():
@@ -216,42 +249,31 @@ def get_metrics():
                         break
     metrics['missing_alt'] = df[df['url'].isin(missing_alt_urls)]
 
-    # 1.7 Broken Links (Based on 404s found during crawl)
-    # Note: To find broken OUTBOUND links requires deeper parsing, here we count broken INTERNAL pages found.
-    metrics['broken_pages'] = df[df['status_code'] == 404]
-
-    # 1.8 - 1.10 Status Codes
+    # 6. Status Codes
     metrics['status_3xx'] = df[(df['status_code'] >= 300) & (df['status_code'] < 400)]
     metrics['status_4xx'] = df[(df['status_code'] >= 400) & (df['status_code'] < 500)]
     metrics['status_5xx'] = df[df['status_code'] >= 500]
 
-    # 1.11 - 1.12 Indexability
+    # 7. Indexability
     metrics['indexable'] = df[df['indexable'] == True]
     metrics['non_indexable'] = df[df['indexable'] == False]
-
-    # 1.15 PageSpeed (Mocked for Demo - requires API)
-    # We use latency as a proxy
-    metrics['slow_pages'] = df[df['latency_ms'] > 2000] # Pages taking > 2s
+    metrics['slow_pages'] = df[df['latency_ms'] > 2000]
 
     return metrics, df
 
 # --- VISUALIZER ---
 def generate_network_graph(df):
     G = nx.DiGraph()
-    
     for _, row in df.iterrows():
         G.add_node(row['url'], title=row['title'], group=row['status_code'])
         if isinstance(row['links'], list):
             for link in row['links']:
-                # Only add edge if target also in df (internal linking structure)
                 if link in df['url'].values:
                     G.add_edge(row['url'], link)
-    
     return G
 
-# --- UI COMPONENTS ---
+# --- UI RENDERER ---
 def render_metric_card(label, value, df_subset, key_suffix):
-    """Renders a metric that can be expanded to show details"""
     with st.container():
         st.markdown(f"""
         <div class="metric-card">
@@ -261,14 +283,26 @@ def render_metric_card(label, value, df_subset, key_suffix):
         """, unsafe_allow_html=True)
         
         if value > 0:
-            with st.expander(f"View {label} Details"):
-                st.dataframe(df_subset[['url', 'title', 'status_code']], use_container_width=True)
+            with st.expander(f"View Details"):
+                st.dataframe(df_subset[['url', 'status_code']], use_container_width=True)
 
 # --- MAIN APP FLOW ---
 
-# Sidebar Controls
+# Sidebar
 with st.sidebar:
     st.header("🎮 Control Panel")
+    
+    # Connection Status Indicators
+    if google_auth_status:
+        st.success("Google Auth: Active")
+    else:
+        st.warning("Google Auth: Inactive (Check Secrets)")
+        
+    if init_mongo_connection():
+        st.success("MongoDB: Connected")
+    else:
+        st.error("MongoDB: Failed")
+
     target_url = st.text_input("Website URL", "https://example.com")
     max_pages_limit = st.number_input("Max Pages", 10, 2000, 50)
     
@@ -277,103 +311,71 @@ with st.sidebar:
         crawl_site(target_url, max_pages_limit)
         st.rerun()
     
-    if col2.button("Delete DB"):
+    if col2.button("Clear DB"):
         coll = get_db_collection()
         if coll is not None:
-            coll.drop()
+            coll.delete_many({})
             st.success("Database Cleared")
             st.rerun()
 
-# Main Tabs
-tab1, tab2, tab3 = st.tabs(["📊 Crawl Report", "🕸️ Site Structure", "🔍 Search Site"])
+# Tabs
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Crawl Report", "🕸️ Site Structure", "🔍 Search", "⚡ Google APIs"])
 
-# Calculate Metrics if DB has data
-metrics_data, full_df = get_metrics() if get_db_collection().count_documents({}) > 0 else (None, None)
+# Load Data
+metrics_data, full_df = get_metrics() if get_db_collection() and get_db_collection().count_documents({}) > 0 else (None, None)
 
 with tab1:
     if metrics_data:
         st.subheader("Site Health Overview")
         
-        # Row 1: High Level
         c1, c2, c3, c4 = st.columns(4)
         with c1: render_metric_card("Total Pages", metrics_data['total_pages'], full_df, "tot")
-        with c2: render_metric_card("Indexable Pages", len(metrics_data['indexable']), metrics_data['indexable'], "idx")
+        with c2: render_metric_card("Indexable", len(metrics_data['indexable']), metrics_data['indexable'], "idx")
         with c3: render_metric_card("Non-Indexable", len(metrics_data['non_indexable']), metrics_data['non_indexable'], "nidx")
-        with c4: render_metric_card("Slow Pages (>2s)", len(metrics_data['slow_pages']), metrics_data['slow_pages'], "slow")
+        with c4: render_metric_card("Slow (>2s)", len(metrics_data['slow_pages']), metrics_data['slow_pages'], "slow")
 
-        st.markdown("---")
-        st.subheader("Content & Metadata Issues")
-        
-        # Row 2: Content Issues
+        st.subheader("Content Issues")
         c1, c2, c3, c4 = st.columns(4)
-        with c1: render_metric_card("Duplicate Content", len(metrics_data['duplicate_content']), metrics_data['duplicate_content'], "dup_cont")
-        with c2: render_metric_card("Duplicate Titles", len(metrics_data['duplicate_titles']), metrics_data['duplicate_titles'], "dup_tit")
-        with c3: render_metric_card("Duplicate Desc", len(metrics_data['duplicate_desc']), metrics_data['duplicate_desc'], "dup_desc")
-        with c4: render_metric_card("Canonical Issues", len(metrics_data['canonical_issues']), metrics_data['canonical_issues'], "canon")
+        with c1: render_metric_card("Dup. Content", len(metrics_data['duplicate_content']), metrics_data['duplicate_content'], "dup_c")
+        with c2: render_metric_card("Dup. Titles", len(metrics_data['duplicate_titles']), metrics_data['duplicate_titles'], "dup_t")
+        with c3: render_metric_card("Dup. Desc", len(metrics_data['duplicate_desc']), metrics_data['duplicate_desc'], "dup_d")
+        with c4: render_metric_card("Canonical Err", len(metrics_data['canonical_issues']), metrics_data['canonical_issues'], "canon")
 
-        # Row 3: Technical & Images
+        st.subheader("Technical Issues")
         c1, c2, c3, c4 = st.columns(4)
-        with c1: render_metric_card("Missing Alt Tags", len(metrics_data['missing_alt']), metrics_data['missing_alt'], "alt")
-        with c2: render_metric_card("3xx Redirection", len(metrics_data['status_3xx']), metrics_data['status_3xx'], "3xx")
-        with c3: render_metric_card("4xx Client Errors", len(metrics_data['status_4xx']), metrics_data['status_4xx'], "4xx")
-        with c4: render_metric_card("5xx Server Errors", len(metrics_data['status_5xx']), metrics_data['status_5xx'], "5xx")
-        
-        st.markdown("---")
-        st.info("Note: 'URL Inspection' and full 'PageSpeed' metrics require Google API keys. Basic latency and structural checks are included above.")
-
+        with c1: render_metric_card("Missing Alt", len(metrics_data['missing_alt']), metrics_data['missing_alt'], "alt")
+        with c2: render_metric_card("3xx Redirects", len(metrics_data['status_3xx']), metrics_data['status_3xx'], "3xx")
+        with c3: render_metric_card("4xx Errors", len(metrics_data['status_4xx']), metrics_data['status_4xx'], "4xx")
+        with c4: render_metric_card("5xx Errors", len(metrics_data['status_5xx']), metrics_data['status_5xx'], "5xx")
     else:
-        st.info("No data found. Please enter a URL and start crawling.")
+        st.info("No crawl data. Please start a crawl.")
 
 with tab2:
     if full_df is not None:
-        st.subheader("Interactive Site Architecture")
-        st.caption("Visualizing internal link structure. Zoom and drag nodes.")
-        
-        # Create Graph
+        st.subheader("Site Architecture Map")
         G = generate_network_graph(full_df)
-        
-        # Initiate PyVis
         net = Network(height='600px', width='100%', bgcolor='#222222', font_color='white')
         net.from_nx(G)
-        
-        # Physics options for stability
         net.toggle_physics(True)
         
-        # Save and display
-        try:
-            path = tempfile.gettempdir() + "/network.html"
-            net.save_graph(path)
-            with open(path, 'r', encoding='utf-8') as f:
-                source_code = f.read()
-            st.components.v1.html(source_code, height=600)
-        except Exception as e:
-            st.error(f"Error generating graph: {e}")
+        path = tempfile.gettempdir() + "/network.html"
+        net.save_graph(path)
+        with open(path, 'r', encoding='utf-8') as f:
+            st.components.v1.html(f.read(), height=600)
     else:
-        st.warning("Crawl the site first to visualize structure.")
+        st.warning("Data needed for visualization.")
 
 with tab3:
-    st.subheader("Global Search")
-    search_query = st.text_input("Search for words or phrases across the entire site")
-    
-    if search_query and get_db_collection() is not None:
+    st.subheader("Deep Search")
+    query = st.text_input("Search content, meta tags, or code")
+    if query and get_db_collection():
         col = get_db_collection()
-        # MongoDB Text Search (requires text index, but we will use Regex for simplicity in this demo)
-        # For production: col.create_index([("page_text", "text")])
-        
-        results = list(col.find(
-            {"page_text": {"$regex": search_query, "$options": "i"}},
-            {"url": 1, "title": 1, "page_text": 1}
-        ))
-        
-        st.markdown(f"**Found {len(results)} pages matching '{search_query}'**")
-        
+        # Regex search for simplicity
+        results = list(col.find({"page_text": {"$regex": query, "$options": "i"}}))
+        st.write(f"Found {len(results)} matches")
         for res in results:
-            with st.expander(f"📄 {res.get('title', 'No Title')} ({res['url']})"):
-                # snippet extraction
-                text = res['page_text']
-                idx = text.lower().find(search_query.lower())
-                start = max(0, idx - 50)
-                end = min(len(text), idx + len(search_query) + 50)
-                snippet = text[start:end]
-                st.markdown(f"...**{snippet}**...")
+            with st.expander(f"{res.get('title')} - {res['url']}"):
+                st.write(f"**Description:** {res.get('meta_desc')}")
                 st.write(f"[Open Link]({res['url']})")
+
+with tab
