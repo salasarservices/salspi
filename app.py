@@ -65,17 +65,31 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- AUTHENTICATION (ROBUST) ---
+# Google Auth
 def setup_google_auth():
     if "google" in st.secrets and "credentials" in st.secrets["google"]:
         try:
             creds = st.secrets["google"]["credentials"]
             
-            # Handle if it's a JSON string (Old format)
+            # Convert to dict if it's not already (handles both formats)
             if isinstance(creds, str):
                 try:
                     creds = json.loads(creds)
                 except json.JSONDecodeError:
                     return False
+            
+            creds_dict = dict(creds)
+
+            # json.dump handles the escaping of newlines automatically
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8') as f:
+                json.dump(creds_dict, f)
+                temp_cred_path = f.name
+            
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_cred_path
+            return True
+        except Exception:
+            return False
+    return False
             
             # Handle if it's a Streamlit AttrDict (New, correct format)
             # We convert to a standard dict to ensure json.dump works
