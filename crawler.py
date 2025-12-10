@@ -1,4 +1,3 @@
-```python
 import asyncio
 import aiohttp
 import async_timeout
@@ -267,3 +266,73 @@ def start_crawl_thread(
     thread = threading.Thread(target=_runner, daemon=True, name="salspi-crawler-thread")
     thread.start()
     return stop_event, thread
+
+
+# Compatibility wrapper expected by existing app.py imports
+class CrawlManager:
+    """
+    Light compatibility wrapper around start_crawl_thread so existing app code that
+    imports CrawlManager can work without changes.
+
+    Usage in app.py (example):
+        cm = CrawlManager(start_url, max_pages=100, workers=4, db_writer=my_writer)
+        cm.start()
+        cm.stop()
+        running = cm.is_running()
+    """
+
+    def __init__(
+        self,
+        start_url: str,
+        max_pages: int = 0,
+        workers: int = 8,
+        timeout: int = 15,
+        max_retries: int = 2,
+        same_host_only: bool = True,
+        progress_cb: Optional[Callable[[dict], None]] = None,
+        db_writer: Optional[Callable[[dict], None]] = None,
+    ):
+        self.start_url = start_url
+        self.max_pages = max_pages
+        self.workers = workers
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.same_host_only = same_host_only
+        self.progress_cb = progress_cb
+        self.db_writer = db_writer
+        self._stop_event: Optional[threading.Event] = None
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        if self._thread and getattr(self._thread, "is_alive", lambda: False)():
+            logger.info("CrawlManager: crawl already running")
+            return
+        stop_event, thread = start_crawl_thread(
+            start_url=self.start_url,
+            max_pages=self.max_pages,
+            workers=self.workers,
+            timeout=self.timeout,
+            max_retries=self.max_retries,
+            same_host_only=self.same_host_only,
+            progress_cb=self.progress_cb,
+            db_writer=self.db_writer,
+        )
+        self._stop_event = stop_event
+        self._thread = thread
+        return thread
+
+    def stop(self):
+        if self._stop_event:
+            self._stop_event.set()
+
+    def is_running(self) -> bool:
+        return self._thread is not None and getattr(self._thread, "is_alive", lambda: False)()
+
+    # convenience: expose underlying thread/stop_event
+    @property
+    def thread(self):
+        return self._thread
+
+    @property
+    def stop_event(self):
+        return self._stop_event
