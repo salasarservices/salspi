@@ -89,13 +89,12 @@ def get_page_hash(content):
 
 def normalize_url(url):
     """
-    Normalizes URL but KEEPS query parameters to support dynamic sites.
-    Only strips the fragment identifier (#).
+    Standardizes URLs to ensure 'site.com/about' and 'site.com/about/' 
+    are treated as the same page.
     """
     try:
         parsed = urlparse(url)
-        # Reconstruct: scheme + netloc + path + params + query
-        # We drop 'fragment' (the part after #)
+        # Reconstruct without fragment (#)
         clean = parsed._replace(fragment="").geturl()
         return clean.rstrip('/')
     except:
@@ -109,6 +108,7 @@ def crawl_site(start_url, max_pages):
     
     start_url = normalize_url(start_url)
     parsed_start = urlparse(start_url)
+    # Allow both www and non-www variations of the domain
     base_domain = parsed_start.netloc.replace('www.', '')
     
     queue = [start_url]
@@ -117,12 +117,15 @@ def crawl_site(start_url, max_pages):
     
     progress_bar = st.progress(0)
     status_text = st.empty()
-    debug_container = st.sidebar.expander("🕷️ Crawler Debug Log", expanded=True)
+    debug_box = st.sidebar.empty() # For real-time feedback
     
-    # Real Browser Header
+    # Robust Headers to mimic a real Chrome browser
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.google.com/',
+        'Connection': 'keep-alive'
     }
     
     while queue and count < max_pages:
@@ -133,12 +136,14 @@ def crawl_site(start_url, max_pages):
         count += 1
         
         progress_bar.progress(count / max_pages)
-        status_text.text(f"Crawling {count}: {url}")
+        status_text.text(f"Crawling {count}/{max_pages}: {url}")
         
         try:
-            time.sleep(0.1)
+            time.sleep(0.1) # Be polite
             start_time = time.time()
-            response = requests.get(url, headers=headers, timeout=15, verify=False)
+            
+            # verify=False is crucial for some server configurations
+            response = requests.get(url, headers=headers, timeout=20, verify=False)
             latency = (time.time() - start_time) * 1000
             
             final_url = normalize_url(response.url)
@@ -189,7 +194,7 @@ def crawl_site(start_url, max_pages):
 
                 # Links
                 all_links = soup.find_all('a', href=True)
-                internal_links_found = 0
+                links_found = 0
                 
                 for link in all_links:
                     raw_link = link['href'].strip()
@@ -199,24 +204,22 @@ def crawl_site(start_url, max_pages):
                     abs_link = urljoin(url, raw_link)
                     clean_link = normalize_url(abs_link)
                     
+                    # Domain Check (Loose matching to catch subdomains/www)
                     link_parsed = urlparse(clean_link)
-                    link_domain = link_parsed.netloc.replace('www.', '')
-                    
-                    # Looser domain check to catch subdomains/www variations
-                    if base_domain in link_domain:
+                    if base_domain in link_parsed.netloc:
                         page_data['links'].append(clean_link)
-                        internal_links_found += 1
+                        links_found += 1
+                        
                         if clean_link not in visited and clean_link not in queue:
                             queue.append(clean_link)
                 
-                # Debug log for first few pages
-                if count <= 5:
-                    debug_container.write(f"✅ {url} -> {internal_links_found} links")
+                if count == 1 and links_found == 0:
+                    debug_box.warning("⚠️ Warning: No internal links found on homepage. Site might be JavaScript-rendered.")
 
             collection.update_one({"url": final_url}, {"$set": page_data}, upsert=True)
 
         except Exception as e:
-            debug_container.error(f"❌ {url}: {e}")
+            # Log failure
             collection.update_one(
                 {"url": url},
                 {"$set": {"url": url, "status_code": 0, "error": str(e), "crawl_time": datetime.now()}},
@@ -231,6 +234,7 @@ def get_metrics():
     col = get_db_collection()
     if col is None: return None, None
     
+    # Exclude heavy text field for performance
     data = list(col.find({}, {'_id': 0, 'page_text': 0}))
     df = pd.DataFrame(data)
     
@@ -300,7 +304,8 @@ def render_metric_card(label, value, df_subset, key_suffix):
             with st.expander(f"View Details"):
                 limit = 50
                 display_df = df_subset[['url', 'status_code']].head(limit)
-                st.dataframe(display_df, use_container_width=True)
+                # UPDATED: Replaced use_container_width with width='stretch'
+                st.dataframe(display_df, width=1000) 
                 if len(df_subset) > limit:
                     st.caption(f"Showing top {limit} of {len(df_subset)} records.")
 
@@ -383,7 +388,7 @@ with tab1:
 with tab2:
     if full_df is not None:
         st.subheader("Site Architecture")
-        st.info("Visualizing strict parent-child hierarchy (Tree Layout).")
+        st.info("Visualizing strict parent-child hierarchy using Graphviz.")
         
         # 1. IDENTIFY ROOT
         root_url = None
@@ -394,55 +399,61 @@ with tab2:
         if not root_url and not full_df.empty:
             root_url = full_df['url'].iloc[0]
 
-        # 2. INITIALIZE GRAPHVIZ (Strict Tree)
+        # 2. INITIALIZE GRAPHVIZ
         graph = graphviz.Digraph(engine='dot')
-        graph.attr(rankdir='TB') # Top-to-Bottom
-        graph.attr(splines='ortho') # Orthogonal (squared) lines for chart look
-        graph.attr(nodesep='0.5', ranksep='1.0')
+        graph.attr(rankdir='TB') # Top to Bottom
+        graph.attr(splines='ortho') # Squared lines like organization chart
+        # Clean Node Styling
+        graph.attr('node', shape='rect', style='filled, rounded', fontname='Arial', fontsize='10', height='0.4')
+        graph.attr('edge', color='#888888')
 
         if root_url:
             queue = [root_url]
             visited_in_tree = {root_url}
-            limit_nodes = 200
+            limit_nodes = 200 # Safety Limit
             
-            # Add Root
-            graph.node(root_url, label='Home', shape='circle', style='filled', fillcolor='#0047AB', fontcolor='white', penwidth='0', fontsize='12', fixedsize='true', width='0.9', height='0.9')
+            # Root Styling
+            graph.node(root_url, label='Home', fillcolor='#0047AB', fontcolor='white')
             
             nodes_count = 1
             
+            # BFS Traversal to build unique Tree
             while queue and nodes_count < limit_nodes:
                 curr_url = queue.pop(0)
                 
+                # Get DB Data
                 row = full_df[full_df['url'] == curr_url]
                 if row.empty: continue
                 links = row.iloc[0]['links']
                 
                 if isinstance(links, list):
                     for link in links:
+                        # CORE LOGIC: Add child only if not already in tree
                         if link in full_df['url'].values and link not in visited_in_tree:
                             visited_in_tree.add(link)
                             queue.append(link)
                             nodes_count += 1
                             
+                            # Child Styling
                             link_row = full_df[full_df['url'] == link].iloc[0]
                             code = link_row['status_code']
                             
-                            # Style for subpages (Blue Circles)
-                            color = '#4A90E2' # Blue
-                            if code >= 400: color = '#D0021B' # Red
-                            elif 300 <= code < 400: color = '#F5A623' # Orange
-                            
+                            color = '#E8F4FA' # Default
+                            if code >= 400: color = '#FFD2D2' # Red
+                            elif 300 <= code < 400: color = '#FFF4D2' # Orange
+                                
                             # Clean Label
                             path = urlparse(link).path.strip('/')
-                            if len(path) > 15: path = path[:12] + '...'
-                            if not path: path = "Page"
+                            label = path[:20] + '...' if len(path) > 20 else path
+                            if not label: label = "Page"
                             
-                            graph.node(link, label=path, shape='circle', style='filled', fillcolor=color, fontcolor='white', penwidth='0', fontsize='10')
+                            graph.node(link, label=label, fillcolor=color)
                             graph.edge(curr_url, link)
 
             if nodes_count >= limit_nodes:
                 st.warning(f"Graph limited to top {limit_nodes} pages.")
 
+            # 3. RENDER
             st.graphviz_chart(graph)
         
         else:
@@ -478,7 +489,8 @@ with tab3:
                     else:
                         snippet = "Match found (text hidden)"
                     search_data.append({"URL": res['url'], "Context": snippet})
-                st.dataframe(pd.DataFrame(search_data), use_container_width=True)
+                # UPDATED: Width fix
+                st.dataframe(pd.DataFrame(search_data), width=1000)
             else:
                 st.warning(f"No pages found containing '{query}'.")
         except Exception as e:
