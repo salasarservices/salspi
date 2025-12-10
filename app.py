@@ -1,5 +1,6 @@
 import streamlit as st
 import time
+import logging
 import pandas as pd
 from crawler import CrawlManager, crawl_site
 from seo_checks import compute_metrics
@@ -65,54 +66,76 @@ with col_left:
     max_pages = st.number_input("Max pages", min_value=10, max_value=20000, value=500, step=10)
     max_workers = st.number_input("Workers", min_value=1, max_value=50, value=8)
 with col_mid:
-    # Start / Pause / Resume / Stop controls
-    if "crawler_manager" not in st.session_state:
-        st.session_state["crawler_manager"] = None
+    # Import the crawler runner (adjust import path if your package layout differs)
+try:
+    from salspi.crawler import start_crawl_thread  # preferred if app is a package
+except Exception:
+    from crawler import start_crawl_thread  # fallback for local import
 
-    manager = st.session_state.get("crawler_manager")
+logger = logging.getLogger("salspi.app")
 
-    if st.button("Start Crawl"):
-        # If an existing manager is running, stop it first
-        if manager and manager.is_running():
-            st.warning("A crawl is already running. Stop it before starting a new crawl.")
+# Ensure session_state keys for the form fields are present (adapt keys if yours differ)
+# If your UI uses different field names, replace these keys accordingly.
+start_url = st.session_state.get("start_url") or st.session_state.get("site_to_crawl")
+max_pages = int(st.session_state.get("max_pages", 500))
+workers = int(st.session_state.get("workers", 8))
+
+# Start Crawl
+if st.button("Start Crawl"):
+    # Read current values from session_state (or fallback to text inputs if you use them)
+    start_url = st.session_state.get("start_url") or st.session_state.get("site_to_crawl") or start_url
+    if not start_url:
+        st.error("Please enter the site to crawl (include scheme).")
+    else:
+        # Prevent launching multiple threads
+        thread_alive = False
+        thread_obj = st.session_state.get("crawl_thread")
+        if thread_obj is not None and getattr(thread_obj, "is_alive", lambda: False)():
+            thread_alive = True
+
+        if thread_alive:
+            st.info("Crawl already running")
         else:
-            manager = CrawlManager(site, max_workers=max_workers, max_pages=max_pages, timeout=10)
-            st.session_state["crawler_manager"] = manager
-            manager.start()
+            stop_event, thread = start_crawl_thread(
+                start_url=start_url,
+                max_pages=max_pages,
+                workers=workers,
+                progress_cb=None,   # supply a progress callback or db_writer if you have one
+                db_writer=None,     # or pass a lightweight db writer function
+            )
+            st.session_state.crawl_stop_event = stop_event
+            st.session_state.crawl_thread = thread
             st.success("Crawl started in background. Use Refresh Progress to update status.")
 
-    # Pause / Resume
-    if manager and manager.is_running() and not manager.is_paused():
-        if st.button("Pause Crawl"):
-            manager.pause()
-            st.info("Crawl paused.")
-    elif manager and manager.is_running() and manager.is_paused():
-        if st.button("Resume Crawl"):
-            manager.resume()
-            st.info("Crawl resumed.")
+# Pause Crawl (optional behaviour)
+if st.button("Pause Crawl"):
+    # Simple behaviour: request stop; you can implement a dedicated pause flag instead
+    if st.session_state.get("crawl_stop_event"):
+        st.session_state.crawl_stop_event.set()
+        st.info("Pause/stop requested; workers will exit. Restart to resume.")
+    else:
+        st.info("No crawl in progress to pause.")
 
-    # Stop
-    if manager and manager.is_running():
-        if st.button("Stop Crawl"):
-            manager.stop()
-            st.info("Stop requested. Background thread will finish shortly.")
+# Stop Crawl
+if st.button("Stop Crawl"):
+    if st.session_state.get("crawl_stop_event"):
+        st.session_state.crawl_stop_event.set()
+        st.info("Stop requested; workers will exit soon.")
+    else:
+        st.info("No crawl in progress.")
 
-    # Refresh progress (manual)
+# Refresh Progress (safe fallback if experimental_rerun is missing)
 if st.button("Refresh Progress"):
-    # Try to call experimental_rerun() if available; otherwise use a safe fallback
     rerun = getattr(st, "experimental_rerun", None)
     if callable(rerun):
         try:
             rerun()
         except Exception:
-            # Fallback: update query params to trigger a rerun
-            import time
+            # fallback: update query params to force a rerun without crashing
             st.experimental_set_query_params(_refresh=int(time.time()))
     else:
-        # Fallback: update query params to trigger a rerun
-        import time
         st.experimental_set_query_params(_refresh=int(time.time()))
-
+# ---- END REPLACE BLOCK ----
 with col_right:
     # DB status
     cfg = get_config()
