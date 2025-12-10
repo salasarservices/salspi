@@ -196,7 +196,6 @@ def get_metrics():
     col = get_db_collection()
     if col is None: return None, None
     
-    # Save memory: do not fetch page_text
     data = list(col.find({}, {'_id': 0, 'page_text': 0}))
     df = pd.DataFrame(data)
     
@@ -287,59 +286,4 @@ with st.sidebar:
             st.warning("Auth: Inactive")
 
     st.markdown("---")
-    target_url = st.text_input("Target URL", "https://example.com")
-    max_pages_limit = st.number_input("Max Pages", 10, 2000, 50)
-    
-    if st.button("Start Crawl", type="primary"):
-        crawl_site(target_url, max_pages_limit)
-        st.rerun()
-    
-    if st.button("Clear Database"):
-        coll = get_db_collection()
-        if coll is not None:
-            coll.delete_many({})
-            st.success("Database Cleared")
-            time.sleep(1)
-            st.rerun()
-
-# --- MAIN LOGIC ---
-tab1, tab2, tab3 = st.tabs(["Crawl Report", "Site Structure", "Deep Search"])
-
-col = get_db_collection()
-has_data = False
-if col is not None:
-    try:
-        if col.count_documents({}, limit=1) > 0:
-            has_data = True
-    except Exception:
-        has_data = False
-
-if has_data:
-    metrics_data, full_df = get_metrics()
-else:
-    metrics_data, full_df = None, None
-
-with tab1:
-    if metrics_data:
-        st.subheader("Site Health Overview")
-        c1, c2, c3, c4 = st.columns(4)
-        with c1: render_metric_card("Total Pages", metrics_data['total_pages'], full_df, "tot")
-        with c2: render_metric_card("Indexable", len(metrics_data['indexable']), metrics_data['indexable'], "idx")
-        with c3: render_metric_card("Non-Indexable", len(metrics_data['non_indexable']), metrics_data['non_indexable'], "nidx")
-        with c4: render_metric_card("Slow (>2s)", len(metrics_data['slow_pages']), metrics_data['slow_pages'], "slow")
-
-        st.subheader("Content Issues")
-        c1, c2, c3, c4 = st.columns(4)
-        with c1: render_metric_card("Dup. Content", len(metrics_data['duplicate_content']), metrics_data['duplicate_content'], "dup_c")
-        with c2: render_metric_card("Dup. Titles", len(metrics_data['duplicate_titles']), metrics_data['duplicate_titles'], "dup_t")
-        with c3: render_metric_card("Dup. Desc", len(metrics_data['duplicate_desc']), metrics_data['duplicate_desc'], "dup_d")
-        with c4: render_metric_card("Canonical Err", len(metrics_data['canonical_issues']), metrics_data['canonical_issues'], "canon")
-
-        st.subheader("Technical Issues")
-        c1, c2, c3, c4 = st.columns(4)
-        with c1: render_metric_card("Missing Alt", len(metrics_data['missing_alt']), metrics_data['missing_alt'], "alt")
-        with c2: render_metric_card("3xx Redirects", len(metrics_data['status_3xx']), metrics_data['status_3xx'], "3xx")
-        with c3: render_metric_card("4xx Errors", len(metrics_data['status_4xx']), metrics_data['status_4xx'], "4xx")
-        with c4: render_metric_card("5xx Errors", len(metrics_data['status_5xx']), metrics_data['status_5xx'], "5xx")
-    else:
-        st.info("No crawl data found. Enter a URL in the sidebar and click 'Start
+    target
