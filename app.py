@@ -11,6 +11,7 @@ import time
 import hashlib
 import os
 from datetime import datetime
+import json
 
 # --- CONFIGURATION & STYLING ---
 st.set_page_config(page_title="SeoSpider Pro", page_icon="🕸️", layout="wide")
@@ -134,20 +135,24 @@ def crawl_site(start_url, max_pages):
                 "page_text": ""
             }
 
+            # Check if valid HTML content
             if response.status_code == 200 and 'text/html' in page_data['content_type']:
                 soup = BeautifulSoup(response.text, 'html.parser')
                 
+                # Metadata
                 page_data['title'] = soup.title.string.strip() if soup.title and soup.title.string else ""
                 meta_desc = soup.find('meta', attrs={'name': 'description'})
                 page_data['meta_desc'] = meta_desc['content'].strip() if meta_desc and meta_desc.get('content') else ""
                 canonical = soup.find('link', rel='canonical')
                 page_data['canonical'] = canonical['href'] if canonical else ""
                 
+                # Content
                 text_content = soup.get_text(separator=' ', strip=True)
                 page_data['word_count'] = len(text_content.split())
                 page_data['content_hash'] = get_page_hash(text_content)
                 page_data['page_text'] = text_content
                 
+                # Images
                 imgs = soup.find_all('img')
                 for img in imgs:
                     src = img.get('src')
@@ -157,10 +162,12 @@ def crawl_site(start_url, max_pages):
                             'alt': img.get('alt', '')
                         })
 
+                # Robots
                 robots_meta = soup.find('meta', attrs={'name': 'robots'})
                 if robots_meta and 'noindex' in robots_meta.get('content', '').lower():
                     page_data['indexable'] = False
 
+                # Links
                 all_links = soup.find_all('a', href=True)
                 for link in all_links:
                     raw_link = link['href'].strip()
@@ -195,6 +202,7 @@ def get_metrics():
     col = get_db_collection()
     if col is None: return None, None
     
+    # Do NOT fetch page_text to save memory
     data = list(col.find({}, {'_id': 0, 'page_text': 0}))
     df = pd.DataFrame(data)
     
@@ -262,9 +270,12 @@ def render_metric_card(label, value, df_subset, key_suffix):
         """, unsafe_allow_html=True)
         if value > 0:
             with st.expander(f"View Details"):
-                st.dataframe(df_subset[['url', 'status_code']].head(50), use_container_width=True)
-                if len(df_subset) > 50:
-                    st.caption(f"Showing top 50 of {len(df_subset)} records.")
+                # Safety Limit: Show max 50 rows to prevent crash
+                limit = 50
+                display_df = df_subset[['url', 'status_code']].head(limit)
+                st.dataframe(display_df, use_container_width=True)
+                if len(df_subset) > limit:
+                    st.caption(f"Showing top {limit} of {len(df_subset)} records to maintain performance.")
 
 # --- SIDEBAR ---
 with st.sidebar:
@@ -340,120 +351,119 @@ with tab1:
     else:
         st.info("No crawl data found. Enter a URL in the sidebar and click 'Start Crawl'.")
 
-# --- UPDATED SITE STRUCTURE (Tab 2) ---
+# --- SITE STRUCTURE (STAR/CLUSTER LAYOUT) ---
 with tab2:
     if full_df is not None:
-        st.subheader("Site Architecture Tree")
-        st.info("Visualizing the FULL website structure. Scroll to zoom. Drag nodes to rearrange.")
+        st.subheader("Site Architecture")
+        st.info("Visualizing site connectivity. Nodes are colored by Status Code (Blue=200, Red=Errors).")
         
-        # 1. Build the NetworkX Graph (Full Data)
+        # 1. Build NetworkX Graph
         G = nx.DiGraph()
         
-        # Add Nodes & Edges
-        for _, row in full_df.iterrows():
-            # Tooltip shows URL + Title
-            hover_text = f"{row['url']}\nTitle: {row['title']}"
+        # Limit to 300 nodes to prevent browser crash (Page Unresponsive error)
+        limit_nodes = 300
+        viz_df = full_df.head(limit_nodes)
+        
+        if len(full_df) > limit_nodes:
+            st.warning(f"⚠️ Graph limited to first {limit_nodes} pages to prevent browser crash. ({len(full_df)} total)")
+
+        for _, row in viz_df.iterrows():
+            # Tooltip
+            hover = f"{row['url']}\nTitle: {row['title']}"
             
-            # Color nodes by Status Code
-            color = "#97C2FC" # Blue (200)
-            if 300 <= row['status_code'] < 400: color = "#FFD699" # Orange
-            elif 400 <= row['status_code'] < 500: color = "#FF9999" # Red
+            # Color Logic (Similar to your red/cluster reference)
+            # 200 = Blue, 404/500 = Red, 301 = Orange
+            color = "#4A90E2" 
+            if 300 <= row['status_code'] < 400: color = "#F5A623"
+            elif row['status_code'] >= 400: color = "#D0021B" # Red for errors
             
-            G.add_node(row['url'], title=hover_text, color=color, label=' ') # Empty label to keep map clean
+            # Size nodes based on incoming links (simplified proxy: more important pages are bigger)
+            size = 15 
+            
+            G.add_node(row['url'], title=hover, color=color, value=size, label=' ')
             
             if isinstance(row['links'], list):
                 for link in row['links']:
-                    if link in full_df['url'].values:
-                        # Blue edge for outgoing connection
-                        G.add_edge(row['url'], link, color="#2B7CE9", width=1)
-                        
-                        # (Optional Logic) If you want to color incoming/outgoing explicitly relative to a node
-                        # PyVis draws edges. The direction is implicit by the arrow.
-                        # Green arrows request: PyVis doesn't support dual-color edges based on "perspective".
-                        # Instead, we rely on the arrow head to show IN vs OUT.
+                    if link in viz_df['url'].values:
+                        G.add_edge(row['url'], link, color="#888888") # Grey edges like reference
 
-        # 2. Configure PyVis for Tree Layout
-        net = Network(height='700px', width='100%', bgcolor='#1a1a1a', font_color='white', directed=True)
+        # 2. PyVis Configuration (Force Directed for Star Shape)
+        net = Network(height='650px', width='100%', bgcolor='#ffffff', font_color='black', directed=True)
         net.from_nx(G)
         
-        # 3. Apply Hierarchical (Tree) Options
-        # This forces the "Tree Shape" requested
+        # Physics options to mimic the "Star/Hub-Spoke" look
         options = {
-            "layout": {
-                "hierarchical": {
-                    "enabled": True,
-                    "direction": "UD", # Up-Down
-                    "sortMethod": "directed",
-                    "nodeSpacing": 150,
-                    "treeSpacing": 200
-                }
-            },
-            "physics": {
-                "hierarchicalRepulsion": {
-                    "centralGravity": 0.0,
-                    "springLength": 100,
-                    "springConstant": 0.01,
-                    "nodeDistance": 120,
-                    "damping": 0.09
-                },
-                "solver": "hierarchicalRepulsion"
+            "nodes": {
+                "shape": "dot",
+                "scaling": {"min": 10, "max": 30}
             },
             "edges": {
-                "smooth": {
-                    "type": "cubicBezier",
-                    "forceDirection": "vertical",
-                    "roundness": 0.4
+                "color": {"inherit": False},
+                "smooth": {"type": "continuous"}
+            },
+            "physics": {
+                "forceAtlas2Based": {
+                    "gravitationalConstant": -50,
+                    "centralGravity": 0.01,
+                    "springLength": 100,
+                    "springConstant": 0.08
                 },
-                "arrows": {
-                    "to": {"enabled": True, "scaleFactor": 1, "type": "arrow"},
-                    "middle": {"enabled": False} # Clean arrows
-                },
-                "color": {"color": "#4A90E2", "highlight": "#00FF00"} # Blue normal, Green on click
+                "maxVelocity": 50,
+                "solver": "forceAtlas2Based",
+                "timestep": 0.35,
+                "stabilization": {"enabled": True, "iterations": 150} # Stabilize before showing
             }
         }
-        
-        # Convert options dict to JSON string for PyVis
-        import json
         net.set_options(json.dumps(options))
         
-        # 4. Render
+        # 3. Render
         path = tempfile.gettempdir() + "/network.html"
         net.save_graph(path)
         with open(path, 'r', encoding='utf-8') as f:
-            st.components.v1.html(f.read(), height=700)
+            st.components.v1.html(f.read(), height=650)
     else:
         st.warning("Data needed for visualization.")
 
-# --- DEEP SEARCH (Tab 3) ---
+# --- DEEP SEARCH ---
 with tab3:
     st.subheader("Search Website Content")
-    st.markdown("Search for specific words or phrases inside the **text content** of crawled pages.")
+    st.markdown("Search for words inside the main content of crawled pages.")
     
-    query = st.text_input("Enter word or phrase:", placeholder="e.g. refund policy")
+    query = st.text_input("Enter search phrase:", placeholder="e.g. contact us")
     
     search_col = get_db_collection()
     if query and search_col is not None:
         try:
+            # Optimize: Only fetch necessary fields, limit results
             results = list(search_col.find(
                 {"page_text": {"$regex": query, "$options": "i"}},
                 {"url": 1, "page_text": 1, "_id": 0}
             ).limit(50))
             
             if results:
-                st.success(f"✅ Found **{len(results)}** pages containing '{query}'")
+                st.success(f"✅ Found **{len(results)}** pages.")
+                
                 search_data = []
                 for res in results:
                     text = res.get('page_text', '')
                     idx = text.lower().find(query.lower())
+                    
                     if idx != -1:
-                        start = max(0, idx - 40)
-                        end = min(len(text), idx + len(query) + 40)
+                        # Extract 50 chars before and after
+                        start = max(0, idx - 50)
+                        end = min(len(text), idx + len(query) + 50)
                         snippet = "..." + text[start:end] + "..."
                     else:
-                        snippet = "(Match found in hidden text)"
-                    search_data.append({"Found On URL": res['url'], "Context Snippet": snippet})
+                        snippet = "Match found (text hidden)"
+                        
+                    search_data.append({
+                        "URL": res['url'],
+                        "Context": snippet
+                    })
+                
                 st.dataframe(pd.DataFrame(search_data), use_container_width=True)
             else:
                 st.warning(f"No pages found containing '{query}'.")
+                
         except Exception as e:
             st.error(f"Search failed: {e}")
