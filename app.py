@@ -10,7 +10,6 @@ import hashlib
 import os
 from datetime import datetime
 import urllib3
-import graphviz
 
 # --- SAFE IMPORTS ---
 try:
@@ -23,17 +22,17 @@ except ImportError:
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- CONFIGURATION & STYLING ---
-st.set_page_config(page_title="SeoSpider Pro Ultimate", page_icon="🕸️", layout="wide")
+st.set_page_config(page_title="SeoSpider Pro", page_icon="🕸️", layout="wide")
 
 st.markdown("""
 <style>
     .metric-card {
-        background-color: #eaf2f8; /* Applied pastel color here */
+        background-color: #eaf2f8;
         border-radius: 10px;
         padding: 20px;
         text-align: center;
         margin-bottom: 10px;
-        border: 1px solid #dce4ec; /* Softer border to match */
+        border: 1px solid #dce4ec;
         height: 140px;
         display: flex;
         flex-direction: column;
@@ -177,7 +176,7 @@ def crawl_site(start_url, max_pages):
                     if src:
                         page_data['images'].append({
                             'src': urljoin(url, src),
-                            'alt': img.get('alt', '') # Empty string if missing
+                            'alt': img.get('alt', '')
                         })
 
                 # Robots / Indexable check
@@ -204,7 +203,7 @@ def crawl_site(start_url, max_pages):
     progress_bar.progress(100)
     status_text.success(f"Crawl Complete! Visited {count} pages.")
 
-# --- ANALYZER (RESTORED METRICS) ---
+# --- ANALYZER (FULL SEO METRICS) ---
 def get_metrics():
     col = get_db_collection()
     if col is None: return None, None
@@ -231,7 +230,6 @@ def get_metrics():
     metrics['total_pages'] = len(df)
     
     # 1.2 Duplicate Content
-    # We ignore empty content pages (like errors)
     content_dupes = df[df.duplicated(subset=['content_hash'], keep=False) & (df['content_hash'] != "")]
     metrics['dup_content_count'] = len(content_dupes)
     metrics['dup_content_df'] = content_dupes
@@ -246,9 +244,9 @@ def get_metrics():
     metrics['dup_desc_count'] = len(desc_dupes)
     metrics['dup_desc_df'] = desc_dupes
     
-    # 1.5 Canonical Issues (Self-referencing mismatch)
+    # 1.5 Canonical Issues
     def check_canonical(row):
-        if not row['canonical']: return False # Missing canonical is an issue too, but we check mismatch here
+        if not row['canonical']: return False 
         return row['canonical'] != row['url']
     canon_issues = df[df.apply(check_canonical, axis=1)]
     metrics['canon_issues_count'] = len(canon_issues)
@@ -265,7 +263,7 @@ def get_metrics():
     metrics['missing_alt_count'] = len(missing_alt_urls)
     metrics['missing_alt_df'] = df[df['url'].isin(missing_alt_urls)]
     
-    # 1.7 Broken Pages (404)
+    # 1.7 Broken Pages
     broken = df[df['status_code'] == 404]
     metrics['broken_count'] = len(broken)
     
@@ -278,8 +276,8 @@ def get_metrics():
     metrics['indexable_count'] = len(df[df['indexable'] == True])
     metrics['non_indexable_count'] = len(df[df['indexable'] == False])
     
-    # 1.15 PageSpeed (Proxy via Latency)
-    slow_pages = df[df['latency_ms'] > 1500] # Threshold 1.5s
+    # 1.15 PageSpeed
+    slow_pages = df[df['latency_ms'] > 1500] 
     metrics['slow_pages_count'] = len(slow_pages)
     metrics['slow_pages_df'] = slow_pages
 
@@ -339,7 +337,7 @@ with st.sidebar:
             st.rerun()
 
 # --- MAIN APP ---
-tab1, tab2, tab3, tab4 = st.tabs(["📊 SEO Report", "🏗️ Architecture", "🧠 NLP Analysis", "🔍 Search"])
+tab1, tab2, tab3 = st.tabs(["📊 SEO Report", "🧠 NLP Analysis", "🔍 Deep Search"])
 
 metrics, df = get_metrics()
 
@@ -369,58 +367,8 @@ with tab1:
     else:
         st.info("No data. Start a crawl first.")
 
-# TAB 2: SITE STRUCTURE (GRAPHVIZ)
+# TAB 2: NLP
 with tab2:
-    st.subheader("Site Hierarchy Tree")
-    if df is not None:
-        graph = graphviz.Digraph(engine='dot')
-        graph.attr(rankdir='TB', splines='ortho')
-        graph.attr('node', shape='rect', style='filled, rounded', fontname='Arial', fontsize='10', height='0.4')
-        graph.attr('edge', color='#888888')
-
-        root_url = None
-        if target_url and normalize_url(target_url) in df['url'].values:
-            root_url = normalize_url(target_url)
-        elif not df.empty:
-            root_url = df['url'].iloc[0]
-
-        if root_url:
-            queue = [root_url]
-            visited = {root_url}
-            limit = 200
-            
-            graph.node(root_url, label='Home', fillcolor='#0047AB', fontcolor='white')
-            
-            count = 1
-            while queue and count < limit:
-                curr = queue.pop(0)
-                row = df[df['url'] == curr]
-                if row.empty: continue
-                links = row.iloc[0]['links']
-                if isinstance(links, list):
-                    for link in links:
-                        if link in df['url'].values and link not in visited:
-                            visited.add(link)
-                            queue.append(link)
-                            count += 1
-                            
-                            # Node Logic
-                            l_row = df[df['url'] == link].iloc[0]
-                            color = '#E8F4FA'
-                            if l_row['status_code'] >= 400: color = '#FFD2D2'
-                            
-                            path = urlparse(link).path.strip('/')
-                            label = path[:15] + '...' if len(path) > 15 else path
-                            if not label: label = "Page"
-                            
-                            graph.node(link, label=label, fillcolor=color)
-                            graph.edge(curr, link)
-            st.graphviz_chart(graph)
-    else:
-        st.warning("Crawl data needed.")
-
-# TAB 3: NLP
-with tab3:
     st.subheader("Content Analysis")
     if df is not None and google_auth_status and NLP_AVAILABLE:
         url_sel = st.selectbox("Select Page:", df['url'].unique())
@@ -440,9 +388,13 @@ with tab3:
                 st.table(pd.DataFrame(e_data))
             else:
                 st.error(err)
+    elif not google_auth_status:
+        st.warning("Google Auth credentials missing.")
+    elif not NLP_AVAILABLE:
+        st.warning("NLP library missing.")
 
-# TAB 4: SEARCH
-with tab4:
+# TAB 3: SEARCH
+with tab3:
     st.subheader("Deep Search")
     q = st.text_input("Query:")
     if q and get_db_collection():
