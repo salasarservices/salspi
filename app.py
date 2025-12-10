@@ -168,4 +168,185 @@ def crawl_site(start_url, max_pages):
 
                 # Links
                 all_links = soup.find_all('a', href=True)
+                
+                # --- THIS IS THE SECTION THAT WAS FAILING ---
                 for link in all_links:
+                    raw_link = link['href'].strip()
+                    
+                    # Check if link is valid
+                    if not raw_link or raw_link.startswith(('mailto:', 'tel:', 'javascript:', '#')):
+                        continue
+                    
+                    abs_link = urljoin(url, raw_link)
+                    clean_link = abs_link.split('#')[0].rstrip('/')
+                    
+                    link_parsed = urlparse(clean_link)
+                    link_domain = link_parsed.netloc.replace('www.', '')
+                    
+                    if link_domain == base_domain:
+                        page_data['links'].append(clean_link)
+                        if clean_link not in visited and clean_link not in queue:
+                            queue.append(clean_link)
+                            
+            # Save to Mongo
+            collection.update_one({"url": url}, {"$set": page_data}, upsert=True)
+
+        except Exception as e:
+            collection.update_one(
+                {"url": url},
+                {"$set": {"url": url, "status_code": 0, "error": str(e), "crawl_time": datetime.now()}},
+                upsert=True
+            )
+
+    progress_bar.progress(100)
+    status_text.success(f"Crawl Complete! Visited {count} pages.")
+
+# --- ANALYZER (OPTIMIZED) ---
+def get_metrics():
+    col = get_db_collection()
+    if col is None: return None, None
+    
+    # Exclude 'page_text' to prevent memory crash
+    data = list(col.find({}, {'_id': 0, 'page_text': 0}))
+    df = pd.DataFrame(data)
+    
+    if df.empty: return None, None
+
+    # Robust Data Cleaning
+    expected_cols = [
+        'url', 'title', 'meta_desc', 'canonical', 'images', 
+        'status_code', 'content_hash', 'indexable', 'latency_ms'
+    ]
+    for c in expected_cols:
+        if c not in df.columns: df[c] = None
+
+    df['meta_desc'] = df['meta_desc'].fillna("")
+    df['title'] = df['title'].fillna("")
+    df['canonical'] = df['canonical'].fillna("")
+    df['content_hash'] = df['content_hash'].fillna("")
+    
+    metrics = {}
+    metrics['total_pages'] = len(df)
+    
+    if 'content_hash' in df.columns:
+        metrics['duplicate_content'] = df[df.duplicated(subset=['content_hash'], keep=False) & (df['content_hash'] != "")]
+    else:
+        metrics['duplicate_content'] = pd.DataFrame()
+
+    metrics['duplicate_titles'] = df[df.duplicated(subset=['title'], keep=False) & (df['title'] != "")]
+    metrics['duplicate_desc'] = df[df.duplicated(subset=['meta_desc'], keep=False) & (df['meta_desc'] != "")]
+    
+    def check_canonical(row):
+        if not row['canonical']: return False
+        return row['canonical'] != row['url']
+    metrics['canonical_issues'] = df[df.apply(check_canonical, axis=1)]
+    
+    missing_alt_urls = []
+    if 'images' in df.columns:
+        for idx, row in df.iterrows():
+            if isinstance(row['images'], list):
+                for img in row['images']:
+                    if isinstance(img, dict) and not img.get('alt'):
+                        missing_alt_urls.append(row['url'])
+                        break
+    metrics['missing_alt'] = df[df['url'].isin(missing_alt_urls)]
+
+    df['status_code'] = pd.to_numeric(df['status_code'], errors='coerce').fillna(0)
+    metrics['status_3xx'] = df[(df['status_code'] >= 300) & (df['status_code'] < 400)]
+    metrics['status_4xx'] = df[(df['status_code'] >= 400) & (df['status_code'] < 500)]
+    metrics['status_5xx'] = df[df['status_code'] >= 500]
+    
+    metrics['indexable'] = df[df['indexable'] == True]
+    metrics['non_indexable'] = df[df['indexable'] == False]
+    
+    df['latency_ms'] = pd.to_numeric(df['latency_ms'], errors='coerce').fillna(0)
+    metrics['slow_pages'] = df[df['latency_ms'] > 2000]
+
+    return metrics, df
+
+# --- VISUALIZER ---
+def generate_network_graph(df):
+    G = nx.DiGraph()
+    # Limit nodes to avoid browser crash
+    limit_df = df.head(100) 
+    
+    for _, row in limit_df.iterrows():
+        G.add_node(row['url'], title=row['title'], group=row['status_code'])
+        if isinstance(row['links'], list):
+            for link in row['links']:
+                if link in limit_df['url'].values:
+                    G.add_edge(row['url'], link)
+    return G
+
+# --- UI HELPER ---
+def render_metric_card(label, value, df_subset, key_suffix):
+    with st.container():
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-value">{value}</div>
+            <div class="metric-label">{label}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        if value > 0:
+            with st.expander(f"View Details"):
+                # Pagination - only show top 50 rows
+                st.dataframe(df_subset[['url', 'status_code']].head(50), use_container_width=True)
+                if len(df_subset) > 50:
+                    st.caption(f"Showing top 50 of {len(df_subset)} records to prevent lag.")
+
+# --- SIDEBAR ---
+with st.sidebar:
+    st.header("🎮 Control Panel")
+    
+    col_s1, col_s2 = st.columns(2)
+    with col_s1:
+        if init_mongo_connection():
+            st.success("DB: Online")
+        else:
+            st.error("DB: Offline")
+    with col_s2:
+        if google_auth_status:
+            st.success("Auth: Active")
+        else:
+            st.warning("Auth: Inactive")
+
+    st.markdown("---")
+    target_url = st.text_input("Target URL", "https://example.com")
+    max_pages_limit = st.number_input("Max Pages", 10, 2000, 50)
+    
+    if st.button("🚀 Start Crawl", type="primary"):
+        crawl_site(target_url, max_pages_limit)
+        st.rerun()
+    
+    if st.button("🗑️ Clear Database"):
+        coll = get_db_collection()
+        if coll is not None:
+            coll.delete_many({})
+            st.success("Database Cleared")
+            time.sleep(1)
+            st.rerun()
+
+# --- MAIN LOGIC ---
+tab1, tab2, tab3 = st.tabs(["📊 Crawl Report", "🕸️ Site Structure", "🔍 Search"])
+
+# Safe Data Loading
+col = get_db_collection()
+has_data = False
+if col is not None:
+    try:
+        if col.count_documents({}, limit=1) > 0:
+            has_data = True
+    except Exception:
+        has_data = False
+
+if has_data:
+    metrics_data, full_df = get_metrics()
+else:
+    metrics_data, full_df = None, None
+
+with tab1:
+    if metrics_data:
+        st.subheader("Site Health Overview")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: render_metric_card("Total Pages", metrics_data['total_pages'], full_df, "tot")
+        with c2: render_
