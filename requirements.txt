@@ -12,3 +12,4 @@ google-auth-httplib2
 dnspython
 lxml
 matplotlib
+graphviz
