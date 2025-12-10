@@ -28,22 +28,28 @@ st.set_page_config(page_title="SeoSpider Pro", page_icon="🕸️", layout="wide
 # PASTEL THEME CSS
 st.markdown("""
 <style>
-    /* Metric Cards */
+    /* Metric Cards - Bigger & Bolder */
     div[data-testid="metric-container"] {
         background-color: #F0F4F8; /* Pastel Blue-Grey */
         border: 1px solid #D9E2EC;
         padding: 15px;
         border-radius: 10px;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
         color: #102A43;
+        transition: transform 0.2s;
+    }
+    div[data-testid="metric-container"]:hover {
+        transform: translateY(-2px);
     }
     div[data-testid="metric-container"] label {
         color: #486581; /* Muted Blue text */
-        font-size: 0.9rem;
+        font-size: 1rem !important;
+        font-weight: 600 !important; /* Semi-bold label */
     }
     div[data-testid="metric-container"] div[data-testid="stMetricValue"] {
-        color: #334E68;
-        font-size: 1.8rem;
+        color: #102A43;
+        font-size: 2.2rem !important; /* Bigger text */
+        font-weight: 800 !important; /* Bolder text */
     }
     
     /* Tabs */
@@ -61,26 +67,30 @@ st.markdown("""
         color: #000000 !important;
         border-color: #90CDF4 !important;
     }
+    
+    /* Table Headers - Bolder */
+    th {
+        font-weight: 800 !important;
+        color: #102A43 !important;
+        font-size: 1.05rem !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# --- AUTHENTICATION (FIXED INDENTATION) ---
+# --- AUTHENTICATION ---
 def setup_google_auth():
     if "google" in st.secrets and "credentials" in st.secrets["google"]:
         try:
             creds = st.secrets["google"]["credentials"]
             
-            # 1. Handle string format (if accidentally pasted as string)
             if isinstance(creds, str):
                 try:
                     creds = json.loads(creds)
                 except json.JSONDecodeError:
                     return False
             
-            # 2. Convert to dictionary
             creds_dict = dict(creds)
 
-            # 3. Write to temp file safely using json.dump
             with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8') as f:
                 json.dump(creds_dict, f)
                 temp_cred_path = f.name
@@ -123,7 +133,6 @@ def get_page_hash(content):
 def normalize_url(url):
     try:
         parsed = urlparse(url)
-        # Keep query params, strip fragment
         clean = parsed._replace(fragment="").geturl()
         return clean.rstrip('/')
     except:
@@ -135,12 +144,11 @@ def crawl_site(start_url, max_pages):
         st.error("Database unavailable.")
         return
     
-    # Reset DB
     collection.delete_many({})
     
     start_url = normalize_url(start_url)
     parsed_start = urlparse(start_url)
-    base_domain = parsed_start.netloc.replace('www.', '') # Loose domain matching
+    base_domain = parsed_start.netloc.replace('www.', '') 
     
     queue = [start_url]
     visited = set()
@@ -192,21 +200,18 @@ def crawl_site(start_url, max_pages):
             if response.status_code == 200 and 'text/html' in page_data['content_type']:
                 soup = BeautifulSoup(response.text, 'html.parser')
                 
-                # Metadata
                 page_data['title'] = soup.title.string.strip() if soup.title and soup.title.string else ""
                 meta_desc = soup.find('meta', attrs={'name': 'description'})
                 page_data['meta_desc'] = meta_desc['content'].strip() if meta_desc and meta_desc.get('content') else ""
                 canonical = soup.find('link', rel='canonical')
                 page_data['canonical'] = canonical['href'] if canonical else ""
                 
-                # Content
                 for script in soup(["script", "style"]):
                     script.extract()
                 text_content = soup.get_text(separator=' ', strip=True)
                 page_data['page_text'] = text_content
                 page_data['content_hash'] = get_page_hash(text_content)
                 
-                # Images
                 imgs = soup.find_all('img')
                 for img in imgs:
                     src = img.get('src')
@@ -216,12 +221,10 @@ def crawl_site(start_url, max_pages):
                             'alt': img.get('alt', '')
                         })
 
-                # Robots
                 robots_meta = soup.find('meta', attrs={'name': 'robots'})
                 if robots_meta and 'noindex' in robots_meta.get('content', '').lower():
                     page_data['indexable'] = False
 
-                # Links
                 all_links = soup.find_all('a', href=True)
                 internal_links_found = 0
                 for link in all_links:
@@ -229,14 +232,12 @@ def crawl_site(start_url, max_pages):
                     if not raw or raw.startswith(('mailto:', 'tel:', 'javascript:', '#')): continue
                     abs_link = normalize_url(urljoin(url, raw))
                     
-                    # Robust Domain Check
                     if base_domain in urlparse(abs_link).netloc:
                         page_data['links'].append(abs_link)
                         internal_links_found += 1
                         if abs_link not in visited and abs_link not in queue:
                             queue.append(abs_link)
                 
-                # Debugging info for the first page
                 if count == 1:
                     debug_log.info(f"Root: Found {internal_links_found} internal links.")
 
@@ -253,7 +254,6 @@ def get_metrics():
     col = get_db_collection()
     if col is None: return None, None
     
-    # Exclude page_text to allow fast loading
     data = list(col.find({}, {'page_text': 0, '_id': 0}))
     df = pd.DataFrame(data)
     if df.empty: return None, None
@@ -262,38 +262,29 @@ def get_metrics():
     for c in cols:
         if c not in df.columns: df[c] = None
 
-    # Fill NaNs
     df['title'] = df['title'].fillna("")
     df['meta_desc'] = df['meta_desc'].fillna("")
     df['content_hash'] = df['content_hash'].fillna("")
     df['latency_ms'] = pd.to_numeric(df['latency_ms'], errors='coerce').fillna(0)
     
     metrics = {}
-    
     metrics['total_pages'] = len(df)
     
-    # Duplicates
     content_dupes = df[df.duplicated(subset=['content_hash'], keep=False) & (df['content_hash'] != "")]
     metrics['dup_content_count'] = len(content_dupes)
-    metrics['dup_content_df'] = content_dupes
     
     title_dupes = df[df.duplicated(subset=['title'], keep=False) & (df['title'] != "")]
     metrics['dup_title_count'] = len(title_dupes)
-    metrics['dup_title_df'] = title_dupes
     
     desc_dupes = df[df.duplicated(subset=['meta_desc'], keep=False) & (df['meta_desc'] != "")]
     metrics['dup_desc_count'] = len(desc_dupes)
-    metrics['dup_desc_df'] = desc_dupes
     
-    # Canonicals
     def check_canonical(row):
         if not row['canonical']: return False 
         return row['canonical'] != row['url']
     canon_issues = df[df.apply(check_canonical, axis=1)]
     metrics['canon_issues_count'] = len(canon_issues)
-    metrics['canon_issues_df'] = canon_issues
     
-    # Alt Tags
     missing_alt_urls = []
     for _, row in df.iterrows():
         if isinstance(row['images'], list):
@@ -302,9 +293,7 @@ def get_metrics():
                     missing_alt_urls.append(row['url'])
                     break
     metrics['missing_alt_count'] = len(missing_alt_urls)
-    metrics['missing_alt_df'] = df[df['url'].isin(missing_alt_urls)]
     
-    # Technical
     metrics['broken_count'] = len(df[df['status_code'] == 404])
     metrics['3xx_count'] = len(df[(df['status_code'] >= 300) & (df['status_code'] < 400)])
     metrics['4xx_count'] = len(df[(df['status_code'] >= 400) & (df['status_code'] < 500)])
@@ -314,17 +303,15 @@ def get_metrics():
     metrics['non_indexable_count'] = len(df[df['indexable'] == False])
     
     metrics['slow_pages_count'] = len(df[df['latency_ms'] > 1500])
-    metrics['slow_pages_df'] = df[df['latency_ms'] > 1500]
 
     return metrics, df
 
-# --- NLP ENGINE (FIXED CRASH) ---
+# --- NLP ENGINE ---
 def analyze_content(text):
     if not NLP_AVAILABLE: return None, "Library missing."
     try:
         client = language_v1.LanguageServiceClient()
         
-        # FIX: Check if text is too short or empty to prevent "Short substrate" error
         if not text or len(text.split()) < 20: 
             return None, "Not enough text on page to analyze (min 20 words)."
             
@@ -392,7 +379,7 @@ with tab1:
         c4.metric("Errors (5xx)", metrics['5xx_count'])
         
         with st.expander("View Full Data Table"):
-            st.dataframe(df, width=2000) # Replaced use_container_width with fixed width or use 'width' param
+            st.dataframe(df, width=2000)
     else:
         st.info("No data found. Start a crawl.")
 
@@ -409,10 +396,26 @@ with tab2:
             if res:
                 s = res['sentiment']
                 c1, c2 = st.columns(2)
-                c1.metric("Sentiment Score", f"{s.score:.2f}")
-                c2.metric("Magnitude", f"{s.magnitude:.2f}")
                 
-                st.write("#### Top Entities")
+                # METRICS WITH TOOLTIPS
+                c1.metric(
+                    "Sentiment Score", 
+                    f"{s.score:.2f}", 
+                    help="Score ranges from -1.0 (Very Negative) to 1.0 (Very Positive)."
+                )
+                c2.metric(
+                    "Magnitude", 
+                    f"{s.magnitude:.2f}",
+                    help="Indicates the strength of emotion in the text (0.0 to +Inf). Higher is stronger."
+                )
+                
+                st.markdown("---")
+                # TABLE HEADER WITH TOOLTIP
+                st.markdown(
+                    "#### Top Entities ℹ️", 
+                    help="Name: The entity found.\nType: Person, Location, Org, etc.\nSalience: Relevance score (0-100%) - How important this word is to the document."
+                )
+                
                 ents = [{"Name": e.name, "Type": language_v1.Entity.Type(e.type_).name, "Salience": f"{e.salience:.2%}"} for e in res['entities'][:10]]
                 st.dataframe(pd.DataFrame(ents), width=2000)
             else:
