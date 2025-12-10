@@ -322,6 +322,23 @@ def analyze_content(text):
     except Exception as e:
         return None, str(e)
 
+# --- REAL-TIME SCRAPER ---
+def scrape_external_page(url):
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        }
+        resp = requests.get(url, headers=headers, timeout=10, verify=False)
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            for script in soup(["script", "style"]):
+                script.extract()
+            return soup.get_text(separator=' ', strip=True), None
+        else:
+            return None, f"Failed to fetch: Status {resp.status_code}"
+    except Exception as e:
+        return None, str(e)
+
 # --- SIDEBAR ---
 with st.sidebar:
     st.header("Control Panel")
@@ -387,39 +404,56 @@ with tab1:
 with tab2:
     st.subheader("Content Intelligence")
     if df is not None and google_auth_status and NLP_AVAILABLE:
-        url_sel = st.selectbox("Select Page:", df['url'].unique())
-        if st.button("Analyze Content"):
+        # Internal Page Analysis
+        url_sel = st.selectbox("Select Internal Page:", df['url'].unique())
+        
+        # External Page Input
+        st.markdown("---")
+        st.markdown("**Competitor Comparison**")
+        comp_url = st.text_input("Enter Competitor URL to Compare:", placeholder="https://competitor.com/similar-page")
+        
+        c1, c2 = st.columns(2)
+        
+        if c1.button("Analyze & Compare"):
+            # 1. Analyze Internal Page
             col = get_db_collection()
             doc = col.find_one({"url": url_sel}, {"page_text": 1})
-            res, err = analyze_content(doc.get('page_text', ''))
+            res_int, err_int = analyze_content(doc.get('page_text', ''))
             
-            if res:
-                s = res['sentiment']
-                c1, c2 = st.columns(2)
+            if res_int:
+                st.markdown("### Internal Page Analysis")
+                s = res_int['sentiment']
+                ic1, ic2 = st.columns(2)
+                ic1.metric("Internal Sentiment", f"{s.score:.2f}", help="Score ranges from -1.0 (Very Negative) to 1.0 (Very Positive).")
+                ic2.metric("Internal Magnitude", f"{s.magnitude:.2f}", help="Strength of emotion (0.0 to +Inf).")
                 
-                # METRICS WITH TOOLTIPS
-                c1.metric(
-                    "Sentiment Score", 
-                    f"{s.score:.2f}", 
-                    help="Score ranges from -1.0 (Very Negative) to 1.0 (Very Positive)."
-                )
-                c2.metric(
-                    "Magnitude", 
-                    f"{s.magnitude:.2f}",
-                    help="Indicates the strength of emotion in the text (0.0 to +Inf). Higher is stronger."
-                )
-                
-                st.markdown("---")
-                # TABLE HEADER WITH TOOLTIP
-                st.markdown(
-                    "#### Top Entities ℹ️", 
-                    help="Name: The entity found.\nType: Person, Location, Org, etc.\nSalience: Relevance score (0-100%) - How important this word is to the document."
-                )
-                
-                ents = [{"Name": e.name, "Type": language_v1.Entity.Type(e.type_).name, "Salience": f"{e.salience:.2%}"} for e in res['entities'][:10]]
-                st.dataframe(pd.DataFrame(ents), width=2000)
+                ents_int = [{"Name": e.name, "Type": language_v1.Entity.Type(e.type_).name, "Salience": f"{e.salience:.2%}"} for e in res_int['entities'][:10]]
+                st.dataframe(pd.DataFrame(ents_int), width=2000)
             else:
-                st.error(err)
+                st.error(f"Internal Page Error: {err_int}")
+
+            # 2. Analyze External Page (If provided)
+            if comp_url:
+                st.markdown("---")
+                st.markdown("### Competitor Analysis (Real-time)")
+                with st.spinner(f"Scraping & Analyzing {comp_url}..."):
+                    comp_text, scrape_err = scrape_external_page(comp_url)
+                    
+                    if comp_text:
+                        res_ext, err_ext = analyze_content(comp_text)
+                        if res_ext:
+                            se = res_ext['sentiment']
+                            ec1, ec2 = st.columns(2)
+                            ec1.metric("Competitor Sentiment", f"{se.score:.2f}", delta_color="off")
+                            ec2.metric("Competitor Magnitude", f"{se.magnitude:.2f}", delta_color="off")
+                            
+                            ents_ext = [{"Name": e.name, "Type": language_v1.Entity.Type(e.type_).name, "Salience": f"{e.salience:.2%}"} for e in res_ext['entities'][:10]]
+                            st.dataframe(pd.DataFrame(ents_ext), width=2000)
+                        else:
+                            st.error(f"Competitor NLP Error: {err_ext}")
+                    else:
+                        st.error(f"Scrape Error: {scrape_err}")
+
     elif not NLP_AVAILABLE:
         st.warning("NLP Library missing.")
     elif not google_auth_status:
