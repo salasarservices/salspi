@@ -404,55 +404,99 @@ with tab1:
 with tab2:
     st.subheader("Content Intelligence")
     if df is not None and google_auth_status and NLP_AVAILABLE:
-        # Internal Page Analysis
+        # --- ORIGINAL FUNCTIONALITY: Single Internal Page Analysis ---
         url_sel = st.selectbox("Select Internal Page:", df['url'].unique())
         
-        # External Page Input
-        st.markdown("---")
-        st.markdown("**Competitor Comparison**")
-        comp_url = st.text_input("Enter Competitor URL to Compare:", placeholder="https://competitor.com/similar-page")
-        
-        c1, c2 = st.columns(2)
-        
-        if c1.button("Analyze & Compare"):
-            # 1. Analyze Internal Page
+        if st.button("Analyze Content"):
             col = get_db_collection()
             doc = col.find_one({"url": url_sel}, {"page_text": 1})
-            res_int, err_int = analyze_content(doc.get('page_text', ''))
+            res, err = analyze_content(doc.get('page_text', ''))
             
-            if res_int:
-                st.markdown("### Internal Page Analysis")
-                s = res_int['sentiment']
-                ic1, ic2 = st.columns(2)
-                ic1.metric("Internal Sentiment", f"{s.score:.2f}", help="Score ranges from -1.0 (Very Negative) to 1.0 (Very Positive).")
-                ic2.metric("Internal Magnitude", f"{s.magnitude:.2f}", help="Strength of emotion (0.0 to +Inf).")
+            if res:
+                s = res['sentiment']
+                c1, c2 = st.columns(2)
                 
-                ents_int = [{"Name": e.name, "Type": language_v1.Entity.Type(e.type_).name, "Salience": f"{e.salience:.2%}"} for e in res_int['entities'][:10]]
-                st.dataframe(pd.DataFrame(ents_int), width=2000)
-            else:
-                st.error(f"Internal Page Error: {err_int}")
-
-            # 2. Analyze External Page (If provided)
-            if comp_url:
+                # METRICS WITH TOOLTIPS
+                c1.metric(
+                    "Sentiment Score", 
+                    f"{s.score:.2f}", 
+                    help="Score ranges from -1.0 (Very Negative) to 1.0 (Very Positive)."
+                )
+                c2.metric(
+                    "Magnitude", 
+                    f"{s.magnitude:.2f}",
+                    help="Indicates the strength of emotion in the text (0.0 to +Inf). Higher is stronger."
+                )
+                
                 st.markdown("---")
-                st.markdown("### Competitor Analysis (Real-time)")
-                with st.spinner(f"Scraping & Analyzing {comp_url}..."):
+                # TABLE HEADER WITH TOOLTIP
+                st.markdown(
+                    "#### Top Entities ℹ️", 
+                    help="Name: The entity found.\nType: Person, Location, Org, etc.\nSalience: Relevance score (0-100%) - How important this word is to the document."
+                )
+                
+                ents = [{"Name": e.name, "Type": language_v1.Entity.Type(e.type_).name, "Salience": f"{e.salience:.2%}"} for e in res['entities'][:10]]
+                st.dataframe(pd.DataFrame(ents), width=2000)
+            else:
+                st.error(err)
+        
+        # --- NEW FUNCTIONALITY: Competitor Comparison (Below) ---
+        st.markdown("---")
+        st.markdown("### Competitor Comparison")
+        st.info("Enter an external URL to compare it against your selected internal page above.")
+        
+        comp_url = st.text_input("Competitor URL:", placeholder="https://competitor.com/similar-page")
+        
+        if st.button("Compare"):
+            if not comp_url:
+                st.warning("Please enter a competitor URL.")
+            else:
+                # 1. Re-analyze Internal Page (for the comparison view)
+                col = get_db_collection()
+                doc = col.find_one({"url": url_sel}, {"page_text": 1})
+                res_int, err_int = analyze_content(doc.get('page_text', ''))
+
+                # 2. Scrape & Analyze External Page
+                with st.spinner("Analyzing both pages..."):
                     comp_text, scrape_err = scrape_external_page(comp_url)
                     
-                    if comp_text:
+                    if not res_int:
+                        st.error(f"Internal Page Error: {err_int}")
+                    elif not comp_text:
+                        st.error(f"Competitor Scrape Error: {scrape_err}")
+                    else:
                         res_ext, err_ext = analyze_content(comp_text)
+                        
                         if res_ext:
-                            se = res_ext['sentiment']
-                            ec1, ec2 = st.columns(2)
-                            ec1.metric("Competitor Sentiment", f"{se.score:.2f}", delta_color="off")
-                            ec2.metric("Competitor Magnitude", f"{se.magnitude:.2f}", delta_color="off")
+                            # --- DISPLAY COMPARISON ---
+                            col1, col2 = st.columns(2)
                             
-                            ents_ext = [{"Name": e.name, "Type": language_v1.Entity.Type(e.type_).name, "Salience": f"{e.salience:.2%}"} for e in res_ext['entities'][:10]]
-                            st.dataframe(pd.DataFrame(ents_ext), width=2000)
+                            # LEFT COLUMN: INTERNAL
+                            with col1:
+                                st.markdown(f"#### Your Page")
+                                st.caption(url_sel)
+                                s_in = res_int['sentiment']
+                                st.metric("Sentiment", f"{s_in.score:.2f}", help="-1.0 to 1.0")
+                                st.metric("Magnitude", f"{s_in.magnitude:.2f}", help="Strength")
+                                
+                                st.markdown("**Top Entities**")
+                                ents_int = [{"Name": e.name, "Salience": f"{e.salience:.1%}"} for e in res_int['entities'][:5]]
+                                st.dataframe(pd.DataFrame(ents_int), width=500)
+
+                            # RIGHT COLUMN: EXTERNAL
+                            with col2:
+                                st.markdown(f"#### Competitor Page")
+                                st.caption(comp_url)
+                                s_ex = res_ext['sentiment']
+                                st.metric("Sentiment", f"{s_ex.score:.2f}")
+                                st.metric("Magnitude", f"{s_ex.magnitude:.2f}")
+                                
+                                st.markdown("**Top Entities**")
+                                ents_ext = [{"Name": e.name, "Salience": f"{e.salience:.1%}"} for e in res_ext['entities'][:5]]
+                                st.dataframe(pd.DataFrame(ents_ext), width=500)
+
                         else:
                             st.error(f"Competitor NLP Error: {err_ext}")
-                    else:
-                        st.error(f"Scrape Error: {scrape_err}")
 
     elif not NLP_AVAILABLE:
         st.warning("NLP Library missing.")
