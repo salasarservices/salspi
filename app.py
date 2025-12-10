@@ -114,9 +114,13 @@ def crawl_site(start_url, max_pages):
     progress_bar = st.progress(0)
     status_text = st.empty()
     
+    # REAL BROWSER HEADER (Crucial for not being blocked)
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
     }
     
     while queue and count < max_pages:
@@ -132,6 +136,7 @@ def crawl_site(start_url, max_pages):
         try:
             time.sleep(0.1)
             start_time = time.time()
+            # verify=False handles sites with self-signed or older SSL certs
             response = requests.get(url, headers=headers, timeout=15, verify=False)
             latency = (time.time() - start_time) * 1000
             
@@ -158,17 +163,20 @@ def crawl_site(start_url, max_pages):
             if response.status_code == 200 and 'text/html' in page_data['content_type']:
                 soup = BeautifulSoup(response.text, 'html.parser')
                 
+                # Metadata
                 page_data['title'] = soup.title.string.strip() if soup.title and soup.title.string else ""
                 meta_desc = soup.find('meta', attrs={'name': 'description'})
                 page_data['meta_desc'] = meta_desc['content'].strip() if meta_desc and meta_desc.get('content') else ""
                 canonical = soup.find('link', rel='canonical')
                 page_data['canonical'] = canonical['href'] if canonical else ""
                 
+                # Content
                 text_content = soup.get_text(separator=' ', strip=True)
                 page_data['word_count'] = len(text_content.split())
                 page_data['content_hash'] = get_page_hash(text_content)
                 page_data['page_text'] = text_content
                 
+                # Images
                 imgs = soup.find_all('img')
                 for img in imgs:
                     src = img.get('src')
@@ -178,10 +186,12 @@ def crawl_site(start_url, max_pages):
                             'alt': img.get('alt', '')
                         })
 
+                # Robots
                 robots_meta = soup.find('meta', attrs={'name': 'robots'})
                 if robots_meta and 'noindex' in robots_meta.get('content', '').lower():
                     page_data['indexable'] = False
 
+                # Links extraction
                 all_links = soup.find_all('a', href=True)
                 for link in all_links:
                     raw_link = link['href'].strip()
@@ -191,17 +201,20 @@ def crawl_site(start_url, max_pages):
                     abs_link = urljoin(url, raw_link)
                     clean_link = normalize_url(abs_link)
                     
+                    # Check domain
                     link_parsed = urlparse(clean_link)
                     link_domain = link_parsed.netloc.replace('www.', '')
                     
                     if link_domain == base_domain:
                         page_data['links'].append(clean_link)
+                        # Add to queue if not visited
                         if clean_link not in visited and clean_link not in queue:
                             queue.append(clean_link)
                             
             collection.update_one({"url": final_url}, {"$set": page_data}, upsert=True)
 
         except Exception as e:
+            # Log failure
             collection.update_one(
                 {"url": url},
                 {"$set": {"url": url, "status_code": 0, "error": str(e), "crawl_time": datetime.now()}},
@@ -216,6 +229,7 @@ def get_metrics():
     col = get_db_collection()
     if col is None: return None, None
     
+    # Optimized fetch
     data = list(col.find({}, {'_id': 0, 'page_text': 0}))
     df = pd.DataFrame(data)
     
@@ -364,7 +378,7 @@ with tab1:
     else:
         st.info("No crawl data found. Enter a URL in the sidebar and click 'Start Crawl'.")
 
-# --- SITE STRUCTURE (STRICT TREE) ---
+# --- SITE STRUCTURE (FIXED TREE VISUALIZATION) ---
 with tab2:
     if full_df is not None:
         st.subheader("Site Architecture")
@@ -385,48 +399,47 @@ with tab2:
         if root_url:
             queue = [root_url]
             visited_in_tree = {root_url} # Tracks nodes already placed in tree
-            limit_nodes = 300 
+            limit_nodes = 300 # Safety Cap
             
-            # Root Styling
-            label = "Home"
-            G.add_node(root_url, label=label, title=root_url, color="#0047AB", size=40)
+            # Add Root Node
+            G.add_node(root_url, label="Home", title=root_url, color="#0047AB", size=40)
             
             nodes_count = 1
             
             while queue and nodes_count < limit_nodes:
                 curr_url = queue.pop(0)
                 
-                # Find DB row for current page
+                # Find DB row
                 row = full_df[full_df['url'] == curr_url]
                 if row.empty: continue
                 
-                # Get its links
                 links = row.iloc[0]['links']
                 if isinstance(links, list):
                     for link in links:
                         # CORE LOGIC: Only add link if it hasn't been placed in tree yet
+                        # This creates the "Tree" structure by ignoring secondary links
                         if link in full_df['url'].values and link not in visited_in_tree:
                             visited_in_tree.add(link)
                             queue.append(link)
                             nodes_count += 1
                             
-                            # Child Styling
+                            # Styling
                             link_row = full_df[full_df['url'] == link].iloc[0]
                             code = link_row['status_code']
                             color = "#4A90E2"
                             if code >= 400: color = "#D0021B"
                             elif 300 <= code < 400: color = "#F5A623"
                             
-                            # Clean Label (e.g. /services/web -> services/web)
+                            # Clean Label
                             path = urlparse(link).path.strip("/")
-                            if len(path) > 20: path = path[:20] + "..."
+                            if len(path) > 15: path = path[:15] + "..."
                             if not path: path = "Page"
                             
                             G.add_node(link, label=path, title=link, color=color, size=20)
                             G.add_edge(curr_url, link, color="#999999")
 
             if nodes_count >= limit_nodes:
-                st.warning(f"Tree truncated at {limit_nodes} pages for performance.")
+                st.warning(f"Tree limited to top {limit_nodes} pages for performance.")
 
             # 3. PyVis Configuration
             net = Network(height='700px', width='100%', bgcolor='#ffffff', font_color='black', directed=True)
@@ -439,22 +452,14 @@ with tab2:
                         "enabled": True,
                         "direction": "UD", # Up-Down
                         "sortMethod": "directed",
-                        "nodeSpacing": 150,
-                        "levelSeparation": 150,
-                        "blockShifting": True,
-                        "edgeMinimization": True,
-                        "parentCentralization": True
+                        "nodeSpacing": 180,
+                        "levelSeparation": 150
                     }
                 },
                 "physics": {
                     "hierarchicalRepulsion": {
-                        "centralGravity": 0.0,
-                        "springLength": 100,
-                        "springConstant": 0.01,
-                        "nodeDistance": 120,
-                        "damping": 0.09
-                    },
-                    "solver": "hierarchicalRepulsion"
+                        "nodeDistance": 180
+                    }
                 },
                 "edges": {
                     "smooth": {"type": "cubicBezier", "forceDirection": "vertical", "roundness": 0.4},
