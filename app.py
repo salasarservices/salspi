@@ -318,8 +318,22 @@ with st.sidebar:
 # --- MAIN TABS ---
 tab1, tab2, tab3 = st.tabs(["📊 Crawl Report", "🕸️ Site Structure", "🔍 Search"])
 
-# Load Data
-metrics_data, full_df = get_metrics() if get_db_collection() and get_db_collection().count_documents({}) > 0 else (None, None)
+# --- MAIN DATA LOADING ---
+col = get_db_collection()
+has_data = False
+
+if col is not None:
+    try:
+        # Check if we have any documents without triggering the bool error
+        if col.count_documents({}, limit=1) > 0:
+            has_data = True
+    except Exception:
+        has_data = False
+
+if has_data:
+    metrics_data, full_df = get_metrics()
+else:
+    metrics_data, full_df = None, None
 
 with tab1:
     if metrics_data:
