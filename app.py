@@ -11,7 +11,7 @@ import os
 from datetime import datetime
 import json
 import urllib3
-import graphviz # NEW IMPORT
+import graphviz 
 
 # Suppress SSL warnings for robust crawling
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -88,10 +88,15 @@ def get_page_hash(content):
     return hashlib.md5(content.encode('utf-8')).hexdigest()
 
 def normalize_url(url):
-    """Strips query params and trailing slashes for consistent matching"""
+    """
+    Normalizes URL but KEEPS query parameters to support dynamic sites.
+    Only strips the fragment identifier (#).
+    """
     try:
         parsed = urlparse(url)
-        clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        # Reconstruct: scheme + netloc + path + params + query
+        # We drop 'fragment' (the part after #)
+        clean = parsed._replace(fragment="").geturl()
         return clean.rstrip('/')
     except:
         return url
@@ -112,6 +117,7 @@ def crawl_site(start_url, max_pages):
     
     progress_bar = st.progress(0)
     status_text = st.empty()
+    debug_container = st.sidebar.expander("🕷️ Crawler Debug Log", expanded=True)
     
     # Real Browser Header
     headers = {
@@ -127,7 +133,7 @@ def crawl_site(start_url, max_pages):
         count += 1
         
         progress_bar.progress(count / max_pages)
-        status_text.text(f"Crawling {count}/{max_pages}: {url}")
+        status_text.text(f"Crawling {count}: {url}")
         
         try:
             time.sleep(0.1)
@@ -181,13 +187,10 @@ def crawl_site(start_url, max_pages):
                             'alt': img.get('alt', '')
                         })
 
-                # Robots
-                robots_meta = soup.find('meta', attrs={'name': 'robots'})
-                if robots_meta and 'noindex' in robots_meta.get('content', '').lower():
-                    page_data['indexable'] = False
-
                 # Links
                 all_links = soup.find_all('a', href=True)
+                internal_links_found = 0
+                
                 for link in all_links:
                     raw_link = link['href'].strip()
                     if not raw_link or raw_link.startswith(('mailto:', 'tel:', 'javascript:', '#')):
@@ -199,14 +202,21 @@ def crawl_site(start_url, max_pages):
                     link_parsed = urlparse(clean_link)
                     link_domain = link_parsed.netloc.replace('www.', '')
                     
-                    if link_domain == base_domain:
+                    # Looser domain check to catch subdomains/www variations
+                    if base_domain in link_domain:
                         page_data['links'].append(clean_link)
+                        internal_links_found += 1
                         if clean_link not in visited and clean_link not in queue:
                             queue.append(clean_link)
-                            
+                
+                # Debug log for first few pages
+                if count <= 5:
+                    debug_container.write(f"✅ {url} -> {internal_links_found} links")
+
             collection.update_one({"url": final_url}, {"$set": page_data}, upsert=True)
 
         except Exception as e:
+            debug_container.error(f"❌ {url}: {e}")
             collection.update_one(
                 {"url": url},
                 {"$set": {"url": url, "status_code": 0, "error": str(e), "crawl_time": datetime.now()}},
@@ -373,7 +383,7 @@ with tab1:
 with tab2:
     if full_df is not None:
         st.subheader("Site Architecture")
-        st.info("Visualizing strict parent-child hierarchy using Graphviz.")
+        st.info("Visualizing strict parent-child hierarchy (Tree Layout).")
         
         # 1. IDENTIFY ROOT
         root_url = None
@@ -384,69 +394,59 @@ with tab2:
         if not root_url and not full_df.empty:
             root_url = full_df['url'].iloc[0]
 
-        # 2. INITIALIZE GRAPHVIZ
-        # 'dot' engine is crucial for hierarchical (tree) layout
+        # 2. INITIALIZE GRAPHVIZ (Strict Tree)
         graph = graphviz.Digraph(engine='dot')
-        graph.attr(rankdir='TB') # Top to Bottom
-        # Node Styling
-        graph.attr('node', shape='box', style='filled', fontname='Helvetica', fontsize='10')
-        # Edge Styling
-        graph.attr('edge', color='#666666')
+        graph.attr(rankdir='TB') # Top-to-Bottom
+        graph.attr(splines='ortho') # Orthogonal (squared) lines for chart look
+        graph.attr(nodesep='0.5', ranksep='1.0')
 
         if root_url:
             queue = [root_url]
             visited_in_tree = {root_url}
-            limit_nodes = 200 # Safety Limit
+            limit_nodes = 200
             
             # Add Root
-            graph.node(root_url, label='Home', fillcolor='#4A90E2', fontcolor='white', penwidth='0')
+            graph.node(root_url, label='Home', shape='circle', style='filled', fillcolor='#0047AB', fontcolor='white', penwidth='0', fontsize='12', fixedsize='true', width='0.9', height='0.9')
             
             nodes_count = 1
             
-            # BFS Traversal for unique parent connections
             while queue and nodes_count < limit_nodes:
                 curr_url = queue.pop(0)
                 
-                # Get links
                 row = full_df[full_df['url'] == curr_url]
                 if row.empty: continue
                 links = row.iloc[0]['links']
                 
                 if isinstance(links, list):
                     for link in links:
-                        # Only add if we crawled it and haven't placed it yet
                         if link in full_df['url'].values and link not in visited_in_tree:
                             visited_in_tree.add(link)
                             queue.append(link)
                             nodes_count += 1
                             
-                            # Styling
                             link_row = full_df[full_df['url'] == link].iloc[0]
                             code = link_row['status_code']
                             
-                            color = '#E8F4FA' # Default light blue
-                            font = 'black'
-                            if code >= 400: 
-                                color = '#FFD2D2' # Light Red
-                            elif 300 <= code < 400:
-                                color = '#FFF4D2' # Light Orange
-                                
+                            # Style for subpages (Blue Circles)
+                            color = '#4A90E2' # Blue
+                            if code >= 400: color = '#D0021B' # Red
+                            elif 300 <= code < 400: color = '#F5A623' # Orange
+                            
                             # Clean Label
                             path = urlparse(link).path.strip('/')
-                            label = path if len(path) < 20 else path[:17] + '...'
-                            if not label: label = "Page"
+                            if len(path) > 15: path = path[:12] + '...'
+                            if not path: path = "Page"
                             
-                            graph.node(link, label=label, fillcolor=color, fontcolor=font, penwidth='0')
+                            graph.node(link, label=path, shape='circle', style='filled', fillcolor=color, fontcolor='white', penwidth='0', fontsize='10')
                             graph.edge(curr_url, link)
 
             if nodes_count >= limit_nodes:
-                st.warning(f"Graph limited to top {limit_nodes} pages for readability.")
+                st.warning(f"Graph limited to top {limit_nodes} pages.")
 
-            # 3. RENDER
             st.graphviz_chart(graph)
         
         else:
-            st.warning("Could not identify a root page to start the tree.")
+            st.warning("Could not identify a root page.")
     else:
         st.warning("Data needed for visualization.")
 
