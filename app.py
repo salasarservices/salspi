@@ -215,41 +215,86 @@ def crawl_site(start_url, max_pages):
 # --- ANALYZER ---
 def get_metrics():
     col = get_db_collection()
-    if col is None: return None
+    if col is None: return None, None
     
-    df = pd.DataFrame(list(col.find({}, {'_id': 0})))
-    if df.empty: return None
+    # 1. Fetch data
+    data = list(col.find({}, {'_id': 0}))
+    df = pd.DataFrame(data)
+    
+    if df.empty: return None, None
+
+    # 2. 🛡️ DATA CLEANING: Ensure all expected columns exist
+    # This prevents KeyErrors if some pages failed to crawl or lack specific tags
+    expected_cols = [
+        'url', 'title', 'meta_desc', 'canonical', 'images', 
+        'status_code', 'content_hash', 'indexable', 'latency_ms'
+    ]
+    
+    for c in expected_cols:
+        if c not in df.columns:
+            df[c] = None # Create missing column with None/Empty values
+
+    # 3. Fill NaN values to prevent comparison errors
+    df['meta_desc'] = df['meta_desc'].fillna("")
+    df['title'] = df['title'].fillna("")
+    df['canonical'] = df['canonical'].fillna("")
+    df['content_hash'] = df['content_hash'].fillna("")
     
     metrics = {}
+    
+    # --- METRICS CALCULATION ---
     metrics['total_pages'] = len(df)
     
+    # Duplicate Content
     if 'content_hash' in df.columns:
-        metrics['duplicate_content'] = df[df.duplicated(subset=['content_hash'], keep=False) & (df['content_hash'] != "")]
+        metrics['duplicate_content'] = df[
+            df.duplicated(subset=['content_hash'], keep=False) & 
+            (df['content_hash'] != "")
+        ]
     else:
         metrics['duplicate_content'] = pd.DataFrame()
 
-    metrics['duplicate_titles'] = df[df.duplicated(subset=['title'], keep=False) & (df['title'] != "")]
-    metrics['duplicate_desc'] = df[df.duplicated(subset=['meta_desc'], keep=False) & (df['meta_desc'] != "")]
+    # Duplicate Metadata
+    metrics['duplicate_titles'] = df[
+        df.duplicated(subset=['title'], keep=False) & 
+        (df['title'] != "")
+    ]
+    metrics['duplicate_desc'] = df[
+        df.duplicated(subset=['meta_desc'], keep=False) & 
+        (df['meta_desc'] != "")
+    ]
     
+    # Canonical Issues
     def check_canonical(row):
-        return row['canonical'] and row['canonical'] != row['url']
-    metrics['canonical_issues'] = df[df.apply(check_canonical, axis=1)] if 'canonical' in df.columns else pd.DataFrame()
+        if not row['canonical']: return False
+        return row['canonical'] != row['url']
+        
+    metrics['canonical_issues'] = df[df.apply(check_canonical, axis=1)]
     
+    # Missing Alt Tags
     missing_alt_urls = []
     if 'images' in df.columns:
         for idx, row in df.iterrows():
             if isinstance(row['images'], list):
                 for img in row['images']:
-                    if not img.get('alt'):
+                    if isinstance(img, dict) and not img.get('alt'):
                         missing_alt_urls.append(row['url'])
                         break
     metrics['missing_alt'] = df[df['url'].isin(missing_alt_urls)]
 
+    # Status Codes (Ensure numeric)
+    df['status_code'] = pd.to_numeric(df['status_code'], errors='coerce').fillna(0)
+    
     metrics['status_3xx'] = df[(df['status_code'] >= 300) & (df['status_code'] < 400)]
     metrics['status_4xx'] = df[(df['status_code'] >= 400) & (df['status_code'] < 500)]
     metrics['status_5xx'] = df[df['status_code'] >= 500]
+
+    # Indexability & Speed
     metrics['indexable'] = df[df['indexable'] == True]
     metrics['non_indexable'] = df[df['indexable'] == False]
+    
+    # Fix Latency
+    df['latency_ms'] = pd.to_numeric(df['latency_ms'], errors='coerce').fillna(0)
     metrics['slow_pages'] = df[df['latency_ms'] > 2000]
 
     return metrics, df
