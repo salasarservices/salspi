@@ -295,7 +295,7 @@ def render_metric_card(label, value, df_subset, key_suffix):
 
 # --- SIDEBAR ---
 with st.sidebar:
-    st.header("🎮 Control Panel")
+    st.header("Control Panel")
     
     col_s1, col_s2 = st.columns(2)
     with col_s1:
@@ -313,8 +313,91 @@ with st.sidebar:
     target_url = st.text_input("Target URL", "https://example.com")
     max_pages_limit = st.number_input("Max Pages", 10, 2000, 50)
     
-    if st.button("🚀 Start Crawl", type="primary"):
+    if st.button("Start Crawl", type="primary"):
         crawl_site(target_url, max_pages_limit)
         st.rerun()
     
-    if st.button("🗑
+    if st.button("Clear Database"):
+        coll = get_db_collection()
+        if coll is not None:
+            coll.delete_many({})
+            st.success("Database Cleared")
+            time.sleep(1)
+            st.rerun()
+
+# --- MAIN LOGIC ---
+tab1, tab2, tab3 = st.tabs(["Crawl Report", "Site Structure", "Search"])
+
+# Safe Data Loading
+col = get_db_collection()
+has_data = False
+if col is not None:
+    try:
+        if col.count_documents({}, limit=1) > 0:
+            has_data = True
+    except Exception:
+        has_data = False
+
+if has_data:
+    metrics_data, full_df = get_metrics()
+else:
+    metrics_data, full_df = None, None
+
+with tab1:
+    if metrics_data:
+        st.subheader("Site Health Overview")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: render_metric_card("Total Pages", metrics_data['total_pages'], full_df, "tot")
+        with c2: render_metric_card("Indexable", len(metrics_data['indexable']), metrics_data['indexable'], "idx")
+        with c3: render_metric_card("Non-Indexable", len(metrics_data['non_indexable']), metrics_data['non_indexable'], "nidx")
+        with c4: render_metric_card("Slow (>2s)", len(metrics_data['slow_pages']), metrics_data['slow_pages'], "slow")
+
+        st.subheader("Content Issues")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: render_metric_card("Dup. Content", len(metrics_data['duplicate_content']), metrics_data['duplicate_content'], "dup_c")
+        with c2: render_metric_card("Dup. Titles", len(metrics_data['duplicate_titles']), metrics_data['duplicate_titles'], "dup_t")
+        with c3: render_metric_card("Dup. Desc", len(metrics_data['duplicate_desc']), metrics_data['duplicate_desc'], "dup_d")
+        with c4: render_metric_card("Canonical Err", len(metrics_data['canonical_issues']), metrics_data['canonical_issues'], "canon")
+
+        st.subheader("Technical Issues")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: render_metric_card("Missing Alt", len(metrics_data['missing_alt']), metrics_data['missing_alt'], "alt")
+        with c2: render_metric_card("3xx Redirects", len(metrics_data['status_3xx']), metrics_data['status_3xx'], "3xx")
+        with c3: render_metric_card("4xx Errors", len(metrics_data['status_4xx']), metrics_data['status_4xx'], "4xx")
+        with c4: render_metric_card("5xx Errors", len(metrics_data['status_5xx']), metrics_data['status_5xx'], "5xx")
+    else:
+        st.info("No crawl data found. Enter a URL in the sidebar and click 'Start Crawl'.")
+
+with tab2:
+    if full_df is not None:
+        st.subheader("Site Architecture Map")
+        st.info("Displaying connections for top 100 pages to ensure performance.")
+        G = generate_network_graph(full_df)
+        net = Network(height='600px', width='100%', bgcolor='#222222', font_color='white')
+        net.from_nx(G)
+        net.toggle_physics(True)
+        
+        path = tempfile.gettempdir() + "/network.html"
+        net.save_graph(path)
+        with open(path, 'r', encoding='utf-8') as f:
+            st.components.v1.html(f.read(), height=600)
+    else:
+        st.warning("Data needed for visualization.")
+
+with tab3:
+    st.subheader("Deep Search")
+    query = st.text_input("Search content...")
+    
+    search_col = get_db_collection()
+    if query and search_col is not None:
+        try:
+            # Limit search results to 20 to prevent crash
+            results = list(search_col.find({"page_text": {"$regex": query, "$options": "i"}}).limit(20))
+            
+            st.write(f"Found {len(results)} matches (Showing top 20)")
+            for res in results:
+                with st.expander(f"{res.get('title')} - {res['url']}"):
+                    st.write(f"**Description:** {res.get('meta_desc')}")
+                    st.write(f"[Open Link]({res['url']})")
+        except Exception as e:
+            st.error(f"Search failed: {e}")
