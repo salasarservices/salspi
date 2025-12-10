@@ -10,6 +10,7 @@ import hashlib
 import os
 import json
 import urllib3
+from datetime import datetime
 
 # --- SAFE IMPORTS ---
 try:
@@ -303,65 +304,6 @@ def get_metrics():
 
     return metrics, df
 
-# --- VISUALIZATION (PYVIS TREE) ---
-def generate_tree_graph(df, root_url):
-    # Create NetworkX Graph (Directed)
-    G = nx.DiGraph()
-    
-    limit_nodes = 200 # Prevent browser crash
-    queue = [root_url]
-    visited = {root_url}
-    
-    # Add Root
-    G.add_node(root_url, label="Home", title=root_url, color="#4A90E2", value=40)
-    
-    count = 1
-    while queue and count < limit_nodes:
-        curr = queue.pop(0)
-        row = df[df['url'] == curr]
-        if row.empty: continue
-        
-        links = row.iloc[0]['links']
-        if isinstance(links, list):
-            for link in links:
-                if link in df['url'].values and link not in visited:
-                    visited.add(link)
-                    queue.append(link)
-                    count += 1
-                    
-                    # Style
-                    l_row = df[df['url'] == link].iloc[0]
-                    color = "#90CDF4" # Light Pastel Blue
-                    if l_row['status_code'] >= 400: color = "#FC8181" # Pastel Red
-                    elif 300 <= l_row['status_code'] < 400: color = "#F6AD55" # Pastel Orange
-                    
-                    label = urlparse(link).path.strip('/')[:15] or "Page"
-                    G.add_node(link, label=label, title=link, color=color, value=20)
-                    G.add_edge(curr, link)
-    
-    # PyVis Settings for Hierarchy
-    net = Network(height='600px', width='100%', bgcolor='#ffffff', font_color='black', directed=True)
-    net.from_nx(G)
-    
-    # Force Hierarchical Layout (Top-Down Tree)
-    net.set_options(json.dumps({
-        "layout": {
-            "hierarchical": {
-                "enabled": True,
-                "direction": "UD",
-                "sortMethod": "directed",
-                "levelSeparation": 150
-            }
-        },
-        "physics": {
-            "hierarchicalRepulsion": {
-                "nodeDistance": 150
-            }
-        }
-    }))
-    
-    return net
-
 # --- NLP ENGINE ---
 def analyze_content(text):
     if not NLP_AVAILABLE: return None, "Library missing."
@@ -403,7 +345,8 @@ with st.sidebar:
             st.rerun()
 
 # --- MAIN APP ---
-tab1, tab2, tab3, tab4 = st.tabs(["📊 SEO Report", "🏗️ Site Structure", "🧠 NLP Analysis", "🔍 Search"])
+# Site Structure Removed as requested
+tab1, tab2, tab3 = st.tabs(["📊 SEO Report", "🧠 NLP Analysis", "🔍 Search"])
 
 metrics, df = get_metrics()
 
@@ -436,30 +379,8 @@ with tab1:
     else:
         st.info("No data found. Start a crawl.")
 
-# TAB 2: SITE STRUCTURE
+# TAB 2: NLP
 with tab2:
-    st.subheader("Interactive Site Tree")
-    if df is not None and not df.empty:
-        # Determine Root
-        root = df['url'].iloc[0]
-        if target_url:
-            clean_target = normalize_url(target_url)
-            if clean_target in df['url'].values:
-                root = clean_target
-        
-        try:
-            net = generate_tree_graph(df, root)
-            path = tempfile.gettempdir() + "/pyvis_graph.html"
-            net.save_graph(path)
-            with open(path, 'r', encoding='utf-8') as f:
-                st.components.v1.html(f.read(), height=600)
-        except Exception as e:
-            st.error(f"Graph Error: {e}")
-    else:
-        st.warning("Crawl data needed.")
-
-# TAB 3: NLP
-with tab3:
     st.subheader("Content Intelligence")
     if df is not None and google_auth_status and NLP_AVAILABLE:
         url_sel = st.selectbox("Select Page:", df['url'].unique())
@@ -484,8 +405,8 @@ with tab3:
     elif not google_auth_status:
         st.warning("Google Auth missing.")
 
-# TAB 4: SEARCH
-with tab4:
+# TAB 3: SEARCH
+with tab3:
     st.subheader("Deep Content Search")
     q = st.text_input("Query:")
     if q and get_db_collection():
