@@ -1,282 +1,269 @@
+```python
+import asyncio
+import aiohttp
+import async_timeout
+import re
 import threading
 import time
-import requests
-from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse
+import logging
+from urllib.parse import urljoin, urldefrag, urlparse
+from urllib.robotparser import RobotFileParser
+from typing import Optional, Callable
 
-from utils import normalize_url, is_same_domain, extract_text, hash_text
-
-DEFAULT_HEADERS = {
-    "User-Agent": "SeoCrawler/1.0 (+https://github.com/yourname)"
-}
+logger = logging.getLogger("salspi.crawler")
+logger.setLevel(logging.INFO)
 
 
-class CrawlManager:
+HREF_RE = re.compile(r'href=[\'"]?([^\'" >]+)', re.IGNORECASE)
+
+
+async def _fetch_robots_txt(session: aiohttp.ClientSession, base_url: str) -> RobotFileParser:
     """
-    Manages a crawl in a background thread. Supports start, pause, resume, stop.
-    Use get_progress() to retrieve progress (pages_crawled, discovered, max_pages).
-    When finished, result is available as `self.result` (same shape as crawl_site returned dict).
+    Fetch robots.txt and return a RobotFileParser instance.
+    If robots.txt cannot be fetched, returns a parser that allows everything.
     """
-    def __init__(self, start_url, max_workers=10, max_pages=1000, timeout=10):
-        self.start_url = normalize_url(start_url, start_url)
-        parsed = urlparse(self.start_url)
-        self.base_netloc = parsed.netloc
-        self.max_workers = max_workers
-        self.max_pages = max_pages
-        self.timeout = timeout
+    parsed = urlparse(base_url)
+    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+    parser = RobotFileParser()
+    try:
+        async with async_timeout.timeout(8):
+            async with session.get(robots_url, allow_redirects=True) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    parser.parse(text.splitlines())
+                    return parser
+    except Exception as e:
+        logger.debug("Could not fetch robots.txt (%s): %s", robots_url, e)
+    # fallback: allow everything
+    parser.parse(["User-agent: *", "Disallow:"])
+    return parser
 
-        # runtime data
-        self.pages = {}   # url -> page_data
-        self.links = {}   # url -> [outs]
-        self.seen = set() # urls submitted
-        self.discovered = 0
-        self.pages_crawled = 0
 
-        # control
-        self._thread = None
-        self._stop_event = threading.Event()
-        self._pause_event = threading.Event()  # when set => paused
-        self._lock = threading.Lock()
+def _normalize_url(base: str, link: str) -> Optional[str]:
+    """
+    Normalize and join a discovered link against a base. Remove fragments.
+    Return None if link is javascript: or mailto: or empty, etc.
+    """
+    if not link:
+        return None
+    link = link.strip()
+    if link.startswith("javascript:") or link.startswith("mailto:") or link.startswith("tel:"):
+        return None
+    # Join relative URLs
+    joined = urljoin(base, link)
+    # Remove fragment
+    clean, _ = urldefrag(joined)
+    return clean
 
-        # result container & status
-        self.result = None
-        self.error = None
-        self.finished = False
 
-    def start(self):
-        if self._thread and self._thread.is_alive():
-            return False
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        return True
+def _extract_links(base_url: str, html: str):
+    """
+    Lightweight HTML anchor extractor using regex (fast, dependency-free).
+    This will miss JS-generated links; use a renderer (Playwright/Puppeteer) if needed.
+    """
+    for match in HREF_RE.findall(html):
+        normalized = _normalize_url(base_url, match)
+        if normalized:
+            yield normalized
 
-    def pause(self):
-        self._pause_event.set()
 
-    def resume(self):
-        self._pause_event.clear()
+async def _fetch_url(session: aiohttp.ClientSession, url: str, timeout: int = 15):
+    """
+    Fetch a URL and return (status, text, headers). Raises on network errors.
+    """
+    async with async_timeout.timeout(timeout):
+        async with session.get(url, allow_redirects=True) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            text = await resp.text(errors="ignore")
+            return resp.status, text, content_type
 
-    def stop(self):
-        self._stop_event.set()
-        # if paused, unpause so thread can notice stop
-        self._pause_event.clear()
-        if self._thread:
-            self._thread.join(timeout=5)
 
-    def is_running(self):
-        return self._thread is not None and self._thread.is_alive() and not self.finished
+async def crawl_site(
+    start_url: str,
+    max_pages: int = 0,
+    workers: int = 8,
+    timeout: int = 15,
+    max_retries: int = 2,
+    same_host_only: bool = True,
+    progress_cb: Optional[Callable[[dict], None]] = None,
+    db_writer: Optional[Callable[[dict], None]] = None,
+    stop_event: Optional[threading.Event] = None,
+):
+    """
+    Asynchronous crawler that starts from start_url and crawls up to max_pages (0 = unlimited).
+    - same_host_only: only follow links on the same netloc as start_url.
+    - progress_cb: optional callback called with {"crawled":int, "discovered":int, "current":str}
+    - db_writer: optional callable to persist documents (gets dict)
+    - stop_event: optional threading.Event to request cancellation from outside
+    Returns a summary dict.
+    """
+    parsed_start = urlparse(start_url)
+    base_netloc = parsed_start.netloc
 
-    def is_paused(self):
-        return self._pause_event.is_set()
+    seen = set()
+    discovered = set()
+    queue = asyncio.Queue()
+    await queue.put(start_url)
+    discovered.add(start_url)
 
-    def is_stopped(self):
-        return self._stop_event.is_set()
+    # counters
+    crawled = 0
+    discovered_count = 1
 
-    def get_progress(self):
-        with self._lock:
-            return {
-                "pages_crawled": self.pages_crawled,
-                "discovered": self.discovered,
-                "max_pages": self.max_pages,
-                "finished": self.finished,
-                "error": self.error,
-            }
+    # For robust retries, we'll keep a small per-URL retry counter
+    retries = {}
 
-    def get_result(self):
-        return self.result
+    session_timeout = aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=30)
 
-    def _fetch(self, session, url):
-        try:
-            t0 = time.time()
-            r = session.get(url, timeout=self.timeout, allow_redirects=True)
-            rt = time.time() - t0
-            status = r.status_code
-            content_type = r.headers.get("Content-Type", "")
-            text = r.text if "html" in content_type else ""
-            soup = BeautifulSoup(text, "lxml") if text else BeautifulSoup("", "lxml")
-            title_tag = soup.title.string.strip() if soup.title and soup.title.string else ""
-            meta_desc = ""
-            canonical = ""
-            for m in soup.find_all("meta"):
-                nm = (m.get("name") or "").lower()
-                prop = (m.get("property") or "").lower()
-                if nm == "description" or prop == "og:description":
-                    meta_desc = meta_desc or m.get("content", "") or ""
-            link_tag = soup.find("link", rel="canonical")
-            if link_tag and link_tag.get("href"):
-                canonical = link_tag.get("href")
-            # headings
-            h_tags = {}
-            for i in range(1, 7):
-                tag = f"h{i}"
-                h_tags[tag] = [t.get_text(strip=True) for t in soup.find_all(tag)]
-            # images
-            images = []
-            for img in soup.find_all("img"):
-                images.append({"src": normalize_url(url, img.get("src")), "alt": (img.get("alt") or "").strip()})
-            # out links
-            out_links = []
-            for a in soup.find_all("a", href=True):
-                out = normalize_url(url, a.get("href"))
-                if out:
-                    out_links.append(out)
-            content_text = extract_text(soup)
-            content_hash = hash_text(content_text) if content_text else ""
-            return {
-                "url": url,
-                "status_code": status,
-                "headers": dict(r.headers),
-                "title": title_tag,
-                "meta_description": meta_desc,
-                "canonical": canonical,
-                "h_tags": h_tags,
-                "images": images,
-                "out_links": out_links,
-                "content_text": content_text,
-                "content_hash": content_hash,
-                "response_time": rt,
-            }
-        except Exception as e:
-            return {
-                "url": url,
-                "status_code": None,
-                "error": str(e),
-                "headers": {},
-                "title": "",
-                "meta_description": "",
-                "canonical": "",
-                "h_tags": {},
-                "images": [],
-                "out_links": [],
-                "content_text": "",
-                "content_hash": "",
-                "response_time": 0.0
-            }
+    async with aiohttp.ClientSession(timeout=session_timeout, headers={"User-Agent": "salspi-crawler/1.0"}) as session:
+        robots = await _fetch_robots_txt(session, start_url)
 
-    def _run(self):
-        """
-        Background crawl runner. Uses ThreadPoolExecutor and submits discovered same-domain links.
-        Honors pause and stop events.
-        """
-        session = requests.Session()
-        session.headers.update(DEFAULT_HEADERS)
+        semaphore = asyncio.Semaphore(workers)
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {}  # future -> url
+        async def worker(worker_id: int):
+            nonlocal crawled, discovered_count
+            while True:
+                if stop_event and stop_event.is_set():
+                    logger.info("Worker %s stopping due to stop_event", worker_id)
+                    break
+                try:
+                    url = await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    # check for completion condition: queue empty and no more work
+                    if queue.empty():
+                        break
+                    else:
+                        continue
 
-            # submit start url
-            start = self.start_url
-            if not start:
-                self.error = "Invalid start URL"
-                self.finished = True
-                return
-            with self._lock:
-                self.seen.add(start)
-                self.discovered = 1
-            futures[executor.submit(self._fetch, session, start)] = start
+                try:
+                    # Respect robots
+                    try:
+                        can_fetch = robots.can_fetch("*", url)
+                    except Exception:
+                        can_fetch = True
 
-            try:
-                while futures and not self._stop_event.is_set():
-                    # Pause handling
-                    if self._pause_event.is_set():
-                        # Sleep in short increments while paused, allowing stop to be noticed
-                        while self._pause_event.is_set() and not self._stop_event.is_set():
-                            time.sleep(0.2)
-                        if self._stop_event.is_set():
-                            break
+                    if not can_fetch:
+                        logger.debug("Blocked by robots.txt: %s", url)
+                        queue.task_done()
+                        continue
 
-                    # Collect completed futures as they finish
-                    done_any = False
-                    for f in as_completed(list(futures.keys()), timeout=1):
-                        done_any = True
-                        origin = futures.pop(f)
-                        page = f.result()
+                    parsed = urlparse(url)
+                    if same_host_only and parsed.netloc != base_netloc:
+                        logger.debug("Skipping external host: %s", url)
+                        queue.task_done()
+                        continue
 
-                        with self._lock:
-                            if origin not in self.pages:
-                                self.pages[origin] = page
-                                self.links[origin] = page.get("out_links", [])
-                                self.pages_crawled += 1
-
-                        # If stop requested, break out
-                        if self._stop_event.is_set():
-                            break
-
-                        # submit discovered same-domain links
-                        for out in page.get("out_links", []):
-                            if not out:
-                                continue
-                            if not is_same_domain(self.base_netloc, out):
-                                continue
-                            norm = normalize_url(out, out)
-                            if not norm:
-                                continue
-                            with self._lock:
-                                if norm in self.seen or len(self.seen) >= self.max_pages:
-                                    continue
-                                self.seen.add(norm)
-                                self.discovered = len(self.seen)
-                            # submit
-                            futures[executor.submit(self._fetch, session, norm)] = norm
-
-                        # Stop if we've crawled enough pages
-                        if self.pages_crawled >= self.max_pages:
-                            self._stop_event.set()
-                            break
-
-                    # If as_completed timed out without any done futures, check loop conditions
-                    if not done_any:
-                        # no futures completed within timeout; if there are still futures, continue and check pause/stop
-                        if self._stop_event.is_set():
-                            break
-                        # small sleep - allow event changes
-                        time.sleep(0.1)
-
-                    # Stop condition - no more futures (all tasks done)
-                    if not futures:
+                    if max_pages and crawled >= max_pages:
+                        queue.task_done()
                         break
 
-                # If stop_event set, try to cancel outstanding futures (best effort)
-                if self._stop_event.is_set():
-                    for f in list(futures.keys()):
-                        f.cancel()
+                    async with semaphore:
+                        attempt = retries.get(url, 0)
+                        try:
+                            status, text, content_type = await _fetch_url(session, url, timeout=timeout)
+                        except Exception as e:
+                            logger.debug("Fetch error for %s: %s (attempt %d)", url, e, attempt)
+                            if attempt < max_retries:
+                                retries[url] = attempt + 1
+                                await queue.put(url)  # retry
+                            else:
+                                logger.info("Giving up on %s after %d attempts", url, attempt)
+                            queue.task_done()
+                            continue
 
-                # Save result snapshot
-                with self._lock:
-                    self.result = {
-                        "pages": dict(self.pages),
-                        "links": dict(self.links),
-                        "start_url": self.start_url,
-                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time())),
-                    }
-                    self.finished = True
-            except Exception as e:
-                self.error = str(e)
-                self.finished = True
-                # Save partial results if any
-                with self._lock:
-                    self.result = {
-                        "pages": dict(self.pages),
-                        "links": dict(self.links),
-                        "start_url": self.start_url,
-                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time())),
-                        "error": self.error
-                    }
+                        # Only process HTML
+                        if "text/html" in content_type.lower():
+                            # Extract links
+                            for link in _extract_links(url, text):
+                                if link not in discovered:
+                                    discovered.add(link)
+                                    discovered_count += 1
+                                    await queue.put(link)
+
+                        # Optionally write to DB (non-blocking if db_writer is quick)
+                        if db_writer:
+                            try:
+                                db_writer({"url": url, "status": status, "fetched_at": time.time()})
+                            except Exception as e:
+                                logger.debug("db_writer failed for %s: %s", url, e)
+
+                        crawled += 1
+                        if progress_cb:
+                            try:
+                                progress_cb({"crawled": crawled, "discovered": discovered_count, "current": url})
+                            except Exception:
+                                logger.debug("progress_cb raised an exception", exc_info=True)
+
+                        logger.info("Crawled %s (%d) content-type=%s", url, crawled, content_type)
+                finally:
+                    queue.task_done()
+
+                # stop if we've reached the limit
+                if max_pages and crawled >= max_pages:
+                    break
+
+        # start workers
+        tasks = [asyncio.create_task(worker(i)) for i in range(max(1, workers))]
+        # Wait until queue is fully processed or stop_event is set or max_pages reached
+        try:
+            # Wait for all tasks; workers will exit when queue is empty or stop_event set
+            await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception:
+            logger.exception("Unexpected error while crawling")
+
+    summary = {
+        "start_url": start_url,
+        "crawled": crawled,
+        "discovered": discovered_count,
+        "timestamp": time.time(),
+    }
+
+    # Final DB write if desired
+    if db_writer:
+        try:
+            db_writer({"type": "summary", **summary})
+        except Exception:
+            logger.debug("db_writer failed for summary", exc_info=True)
+
+    return summary
 
 
-def crawl_site(start_url, max_workers=10, max_pages=1000, timeout=10):
+def start_crawl_thread(
+    start_url: str,
+    max_pages: int = 0,
+    workers: int = 8,
+    timeout: int = 15,
+    max_retries: int = 2,
+    same_host_only: bool = True,
+    progress_cb: Optional[Callable[[dict], None]] = None,
+    db_writer: Optional[Callable[[dict], None]] = None,
+):
     """
-    Backwards-compatible synchronous crawl function.
-
-    Many parts of the app (or older code) import crawl_site directly. The new crawler
-    primarily exposes CrawlManager for background crawling, but this helper lets you
-    run a blocking/synchronous crawl that returns the final crawl snapshot (same shape
-    as CrawlManager.result).
-
-    Usage: crawl = crawl_site("https://example.com", max_workers=8, max_pages=500)
+    Launch crawl_site(...) in a background daemon thread. Returns (stop_event, thread).
+    Call stop_event.set() to request cancellation.
     """
-    mgr = CrawlManager(start_url, max_workers=max_workers, max_pages=max_pages, timeout=timeout)
-    # call the runner synchronously (blocking) so callers expecting a return value get the result
-    mgr._run()
-    return mgr.get_result()
+
+    stop_event = threading.Event()
+
+    def _runner():
+        try:
+            # Run the async crawler to completion in this thread
+            asyncio.run(
+                crawl_site(
+                    start_url=start_url,
+                    max_pages=max_pages,
+                    workers=workers,
+                    timeout=timeout,
+                    max_retries=max_retries,
+                    same_host_only=same_host_only,
+                    progress_cb=progress_cb,
+                    db_writer=db_writer,
+                    stop_event=stop_event,
+                )
+            )
+        except Exception:
+            logger.exception("Crawler thread crashed")
+
+    thread = threading.Thread(target=_runner, daemon=True, name="salspi-crawler-thread")
+    thread.start()
+    return stop_event, thread
