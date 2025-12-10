@@ -134,7 +134,6 @@ def crawl_site(start_url, max_pages):
                 "page_text": ""
             }
 
-            # Fixed Syntax Error Here: Joined onto one line
             if response.status_code == 200 and 'text/html' in page_data['content_type']:
                 soup = BeautifulSoup(response.text, 'html.parser')
                 
@@ -252,19 +251,6 @@ def get_metrics():
 
     return metrics, df
 
-# --- VISUALIZER ---
-def generate_network_graph(df):
-    G = nx.DiGraph()
-    limit_df = df.head(100) 
-    
-    for _, row in limit_df.iterrows():
-        G.add_node(row['url'], title=row['title'], group=row['status_code'])
-        if isinstance(row['links'], list):
-            for link in row['links']:
-                if link in limit_df['url'].values:
-                    G.add_edge(row['url'], link)
-    return G
-
 # --- UI HELPER ---
 def render_metric_card(label, value, df_subset, key_suffix):
     with st.container():
@@ -354,23 +340,91 @@ with tab1:
     else:
         st.info("No crawl data found. Enter a URL in the sidebar and click 'Start Crawl'.")
 
+# --- UPDATED SITE STRUCTURE (Tab 2) ---
 with tab2:
     if full_df is not None:
-        st.subheader("Site Architecture Map")
-        st.info("Displaying connections for top 100 pages.")
-        G = generate_network_graph(full_df)
-        net = Network(height='600px', width='100%', bgcolor='#222222', font_color='white')
-        net.from_nx(G)
-        net.toggle_physics(True)
+        st.subheader("Site Architecture Tree")
+        st.info("Visualizing the FULL website structure. Scroll to zoom. Drag nodes to rearrange.")
         
+        # 1. Build the NetworkX Graph (Full Data)
+        G = nx.DiGraph()
+        
+        # Add Nodes & Edges
+        for _, row in full_df.iterrows():
+            # Tooltip shows URL + Title
+            hover_text = f"{row['url']}\nTitle: {row['title']}"
+            
+            # Color nodes by Status Code
+            color = "#97C2FC" # Blue (200)
+            if 300 <= row['status_code'] < 400: color = "#FFD699" # Orange
+            elif 400 <= row['status_code'] < 500: color = "#FF9999" # Red
+            
+            G.add_node(row['url'], title=hover_text, color=color, label=' ') # Empty label to keep map clean
+            
+            if isinstance(row['links'], list):
+                for link in row['links']:
+                    if link in full_df['url'].values:
+                        # Blue edge for outgoing connection
+                        G.add_edge(row['url'], link, color="#2B7CE9", width=1)
+                        
+                        # (Optional Logic) If you want to color incoming/outgoing explicitly relative to a node
+                        # PyVis draws edges. The direction is implicit by the arrow.
+                        # Green arrows request: PyVis doesn't support dual-color edges based on "perspective".
+                        # Instead, we rely on the arrow head to show IN vs OUT.
+
+        # 2. Configure PyVis for Tree Layout
+        net = Network(height='700px', width='100%', bgcolor='#1a1a1a', font_color='white', directed=True)
+        net.from_nx(G)
+        
+        # 3. Apply Hierarchical (Tree) Options
+        # This forces the "Tree Shape" requested
+        options = {
+            "layout": {
+                "hierarchical": {
+                    "enabled": True,
+                    "direction": "UD", # Up-Down
+                    "sortMethod": "directed",
+                    "nodeSpacing": 150,
+                    "treeSpacing": 200
+                }
+            },
+            "physics": {
+                "hierarchicalRepulsion": {
+                    "centralGravity": 0.0,
+                    "springLength": 100,
+                    "springConstant": 0.01,
+                    "nodeDistance": 120,
+                    "damping": 0.09
+                },
+                "solver": "hierarchicalRepulsion"
+            },
+            "edges": {
+                "smooth": {
+                    "type": "cubicBezier",
+                    "forceDirection": "vertical",
+                    "roundness": 0.4
+                },
+                "arrows": {
+                    "to": {"enabled": True, "scaleFactor": 1, "type": "arrow"},
+                    "middle": {"enabled": False} # Clean arrows
+                },
+                "color": {"color": "#4A90E2", "highlight": "#00FF00"} # Blue normal, Green on click
+            }
+        }
+        
+        # Convert options dict to JSON string for PyVis
+        import json
+        net.set_options(json.dumps(options))
+        
+        # 4. Render
         path = tempfile.gettempdir() + "/network.html"
         net.save_graph(path)
         with open(path, 'r', encoding='utf-8') as f:
-            st.components.v1.html(f.read(), height=600)
+            st.components.v1.html(f.read(), height=700)
     else:
         st.warning("Data needed for visualization.")
 
-# --- DEEP SEARCH TAB ---
+# --- DEEP SEARCH (Tab 3) ---
 with tab3:
     st.subheader("Search Website Content")
     st.markdown("Search for specific words or phrases inside the **text content** of crawled pages.")
@@ -380,8 +434,6 @@ with tab3:
     search_col = get_db_collection()
     if query and search_col is not None:
         try:
-            # 1. Search strictly in 'page_text' with regex
-            # Limit to 50 to prevent browser crash, but fetch enough to be useful
             results = list(search_col.find(
                 {"page_text": {"$regex": query, "$options": "i"}},
                 {"url": 1, "page_text": 1, "_id": 0}
@@ -389,29 +441,19 @@ with tab3:
             
             if results:
                 st.success(f"✅ Found **{len(results)}** pages containing '{query}'")
-                
-                # Prepare data for clean table
                 search_data = []
                 for res in results:
-                    # Create a snippet of text around the match
                     text = res.get('page_text', '')
                     idx = text.lower().find(query.lower())
-                    
                     if idx != -1:
                         start = max(0, idx - 40)
                         end = min(len(text), idx + len(query) + 40)
                         snippet = "..." + text[start:end] + "..."
                     else:
                         snippet = "(Match found in hidden text)"
-                        
-                    search_data.append({
-                        "Found On URL": res['url'],
-                        "Context Snippet": snippet
-                    })
-                
+                    search_data.append({"Found On URL": res['url'], "Context Snippet": snippet})
                 st.dataframe(pd.DataFrame(search_data), use_container_width=True)
             else:
                 st.warning(f"No pages found containing '{query}'.")
-                
         except Exception as e:
             st.error(f"Search failed: {e}")
