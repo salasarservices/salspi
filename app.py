@@ -11,6 +11,13 @@ import time
 import hashlib
 import os
 from datetime import datetime
+# DEBUG: Test Connection
+try:
+    client = pymongo.MongoClient(st.secrets["mongo"]["uri"], serverSelectionTimeoutMS=5000)
+    client.admin.command('ping')
+    st.sidebar.success("✅ MongoDB Connected Successfully!")
+except Exception as e:
+    st.sidebar.error(f"❌ Connection Error: {e}")
 
 # --- CONFIGURATION & STYLING ---
 st.set_page_config(page_title="SeoSpider Pro", page_icon="🕸️", layout="wide")
