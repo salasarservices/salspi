@@ -64,13 +64,28 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- AUTHENTICATION ---
+# --- AUTHENTICATION (ROBUST) ---
 def setup_google_auth():
     if "google" in st.secrets and "credentials" in st.secrets["google"]:
         try:
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-                f.write(st.secrets["google"]["credentials"])
+            creds = st.secrets["google"]["credentials"]
+            
+            # Handle if it's a JSON string (Old format)
+            if isinstance(creds, str):
+                try:
+                    creds = json.loads(creds)
+                except json.JSONDecodeError:
+                    return False
+            
+            # Handle if it's a Streamlit AttrDict (New, correct format)
+            # We convert to a standard dict to ensure json.dump works
+            creds_dict = dict(creds)
+
+            # Dump to a temporary file for the Google Library to read
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8') as f:
+                json.dump(creds_dict, f)
                 temp_cred_path = f.name
+            
             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_cred_path
             return True
         except Exception:
@@ -109,7 +124,6 @@ def get_page_hash(content):
 def normalize_url(url):
     try:
         parsed = urlparse(url)
-        # Keep query params, strip fragment
         clean = parsed._replace(fragment="").geturl()
         return clean.rstrip('/')
     except:
@@ -121,12 +135,11 @@ def crawl_site(start_url, max_pages):
         st.error("Database unavailable.")
         return
     
-    # Reset DB
     collection.delete_many({})
     
     start_url = normalize_url(start_url)
     parsed_start = urlparse(start_url)
-    base_domain = parsed_start.netloc.replace('www.', '') # Loose domain matching
+    base_domain = parsed_start.netloc.replace('www.', '') 
     
     queue = [start_url]
     visited = set()
@@ -178,21 +191,18 @@ def crawl_site(start_url, max_pages):
             if response.status_code == 200 and 'text/html' in page_data['content_type']:
                 soup = BeautifulSoup(response.text, 'html.parser')
                 
-                # Metadata
                 page_data['title'] = soup.title.string.strip() if soup.title and soup.title.string else ""
                 meta_desc = soup.find('meta', attrs={'name': 'description'})
                 page_data['meta_desc'] = meta_desc['content'].strip() if meta_desc and meta_desc.get('content') else ""
                 canonical = soup.find('link', rel='canonical')
                 page_data['canonical'] = canonical['href'] if canonical else ""
                 
-                # Content
                 for script in soup(["script", "style"]):
                     script.extract()
                 text_content = soup.get_text(separator=' ', strip=True)
                 page_data['page_text'] = text_content
                 page_data['content_hash'] = get_page_hash(text_content)
                 
-                # Images
                 imgs = soup.find_all('img')
                 for img in imgs:
                     src = img.get('src')
@@ -202,12 +212,10 @@ def crawl_site(start_url, max_pages):
                             'alt': img.get('alt', '')
                         })
 
-                # Robots
                 robots_meta = soup.find('meta', attrs={'name': 'robots'})
                 if robots_meta and 'noindex' in robots_meta.get('content', '').lower():
                     page_data['indexable'] = False
 
-                # Links
                 all_links = soup.find_all('a', href=True)
                 internal_links_found = 0
                 for link in all_links:
@@ -215,14 +223,12 @@ def crawl_site(start_url, max_pages):
                     if not raw or raw.startswith(('mailto:', 'tel:', 'javascript:', '#')): continue
                     abs_link = normalize_url(urljoin(url, raw))
                     
-                    # Robust Domain Check
                     if base_domain in urlparse(abs_link).netloc:
                         page_data['links'].append(abs_link)
                         internal_links_found += 1
                         if abs_link not in visited and abs_link not in queue:
                             queue.append(abs_link)
                 
-                # Debugging info for the first page
                 if count == 1:
                     debug_log.info(f"Root: Found {internal_links_found} internal links.")
 
@@ -239,7 +245,6 @@ def get_metrics():
     col = get_db_collection()
     if col is None: return None, None
     
-    # Exclude page_text to allow fast loading
     data = list(col.find({}, {'page_text': 0, '_id': 0}))
     df = pd.DataFrame(data)
     if df.empty: return None, None
@@ -248,38 +253,29 @@ def get_metrics():
     for c in cols:
         if c not in df.columns: df[c] = None
 
-    # Fill NaNs
     df['title'] = df['title'].fillna("")
     df['meta_desc'] = df['meta_desc'].fillna("")
     df['content_hash'] = df['content_hash'].fillna("")
     df['latency_ms'] = pd.to_numeric(df['latency_ms'], errors='coerce').fillna(0)
     
     metrics = {}
-    
     metrics['total_pages'] = len(df)
     
-    # Duplicates
     content_dupes = df[df.duplicated(subset=['content_hash'], keep=False) & (df['content_hash'] != "")]
     metrics['dup_content_count'] = len(content_dupes)
-    metrics['dup_content_df'] = content_dupes
     
     title_dupes = df[df.duplicated(subset=['title'], keep=False) & (df['title'] != "")]
     metrics['dup_title_count'] = len(title_dupes)
-    metrics['dup_title_df'] = title_dupes
     
     desc_dupes = df[df.duplicated(subset=['meta_desc'], keep=False) & (df['meta_desc'] != "")]
     metrics['dup_desc_count'] = len(desc_dupes)
-    metrics['dup_desc_df'] = desc_dupes
     
-    # Canonicals
     def check_canonical(row):
         if not row['canonical']: return False 
         return row['canonical'] != row['url']
     canon_issues = df[df.apply(check_canonical, axis=1)]
     metrics['canon_issues_count'] = len(canon_issues)
-    metrics['canon_issues_df'] = canon_issues
     
-    # Alt Tags
     missing_alt_urls = []
     for _, row in df.iterrows():
         if isinstance(row['images'], list):
@@ -288,9 +284,7 @@ def get_metrics():
                     missing_alt_urls.append(row['url'])
                     break
     metrics['missing_alt_count'] = len(missing_alt_urls)
-    metrics['missing_alt_df'] = df[df['url'].isin(missing_alt_urls)]
     
-    # Technical
     metrics['broken_count'] = len(df[df['status_code'] == 404])
     metrics['3xx_count'] = len(df[(df['status_code'] >= 300) & (df['status_code'] < 400)])
     metrics['4xx_count'] = len(df[(df['status_code'] >= 400) & (df['status_code'] < 500)])
@@ -300,7 +294,6 @@ def get_metrics():
     metrics['non_indexable_count'] = len(df[df['indexable'] == False])
     
     metrics['slow_pages_count'] = len(df[df['latency_ms'] > 1500])
-    metrics['slow_pages_df'] = df[df['latency_ms'] > 1500]
 
     return metrics, df
 
@@ -345,7 +338,6 @@ with st.sidebar:
             st.rerun()
 
 # --- MAIN APP ---
-# Site Structure Removed as requested
 tab1, tab2, tab3 = st.tabs(["📊 SEO Report", "🧠 NLP Analysis", "🔍 Search"])
 
 metrics, df = get_metrics()
@@ -375,7 +367,7 @@ with tab1:
         c4.metric("Errors (5xx)", metrics['5xx_count'])
         
         with st.expander("View Full Data Table"):
-            st.dataframe(df, use_container_width=True)
+            st.dataframe(df, width=1500) # Changed to fixed int width or use "stretch" if valid in your version
     else:
         st.info("No data found. Start a crawl.")
 
@@ -397,13 +389,14 @@ with tab2:
                 
                 st.write("#### Top Entities")
                 ents = [{"Name": e.name, "Type": language_v1.Entity.Type(e.type_).name, "Salience": f"{e.salience:.2%}"} for e in res['entities'][:10]]
-                st.dataframe(pd.DataFrame(ents), use_container_width=True)
+                # Updated dataframe width
+                st.dataframe(pd.DataFrame(ents), use_container_width=True) 
             else:
                 st.error(err)
     elif not NLP_AVAILABLE:
-        st.warning("NLP Library missing.")
+        st.warning("NLP Library missing. Install google-cloud-language")
     elif not google_auth_status:
-        st.warning("Google Auth missing.")
+        st.warning("Google Auth missing. Check secrets.")
 
 # TAB 3: SEARCH
 with tab3:
