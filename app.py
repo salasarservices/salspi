@@ -9,11 +9,15 @@ import time
 import hashlib
 import os
 from datetime import datetime
-import json
 import urllib3
 
-# NEW: Google Cloud NLP Import
-from google.cloud import language_v1
+# --- SAFE IMPORTS ---
+# This prevents the app from crashing instantly if a library is missing
+try:
+    from google.cloud import language_v1
+    NLP_AVAILABLE = True
+except ImportError:
+    NLP_AVAILABLE = False
 
 # Suppress SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -78,6 +82,9 @@ def get_db_collection():
 # --- NLP ENGINE ---
 def analyze_content(text):
     """Calls Google Cloud Natural Language API"""
+    if not NLP_AVAILABLE:
+        return None, "Library 'google-cloud-language' is missing."
+
     try:
         client = language_v1.LanguageServiceClient()
         
@@ -90,14 +97,14 @@ def analyze_content(text):
         # 1. Analyze Sentiment
         sentiment = client.analyze_sentiment(request={'document': document}).document_sentiment
         
-        # 2. Analyze Entities (People, Brands, etc.)
+        # 2. Analyze Entities
         entities = client.analyze_entities(request={'document': document}).entities
         
-        # 3. Classify Content (Categories) - Requires 20+ words
+        # 3. Classify Content
         try:
             categories = client.classify_text(request={'document': document}).categories
         except:
-            categories = [] # Fallback if text is ambiguous
+            categories = [] 
 
         return {
             "sentiment_score": sentiment.score,
@@ -150,7 +157,7 @@ def crawl_site(start_url, max_pages):
         count += 1
         
         progress_bar.progress(count / max_pages)
-        status_text.text(f"Crawling {count}/{max_pages}: {url}")
+        status_text.text(f"Crawling {count}: {url}")
         
         try:
             time.sleep(0.1)
@@ -175,28 +182,24 @@ def crawl_site(start_url, max_pages):
             if response.status_code == 200 and 'text/html' in page_data['content_type']:
                 soup = BeautifulSoup(response.text, 'html.parser')
                 
-                # Metadata
                 page_data['title'] = soup.title.string.strip() if soup.title and soup.title.string else ""
                 meta_desc = soup.find('meta', attrs={'name': 'description'})
                 page_data['meta_desc'] = meta_desc['content'].strip() if meta_desc and meta_desc.get('content') else ""
                 canonical = soup.find('link', rel='canonical')
                 page_data['canonical'] = canonical['href'] if canonical else ""
                 
-                # Content
-                # Remove scripts and styles for cleaner NLP
+                # Clean text for NLP
                 for script in soup(["script", "style"]):
                     script.extract()
                 text_content = soup.get_text(separator=' ', strip=True)
                 page_data['page_text'] = text_content
                 
-                # Images
                 imgs = soup.find_all('img')
                 for img in imgs:
                     src = img.get('src')
                     if src:
                         page_data['images'].append({'src': urljoin(url, src), 'alt': img.get('alt', '')})
 
-                # Links
                 all_links = soup.find_all('a', href=True)
                 for link in all_links:
                     raw = link['href'].strip()
@@ -220,11 +223,11 @@ def get_metrics():
     col = get_db_collection()
     if col is None: return None, None
     
+    # Exclude page_text to allow large DBs to load fast
     data = list(col.find({}, {'page_text': 0, '_id': 0}))
     df = pd.DataFrame(data)
     if df.empty: return None, None
 
-    # Normalization
     cols = ['url', 'title', 'meta_desc', 'canonical', 'images', 'status_code']
     for c in cols: 
         if c not in df.columns: df[c] = None
@@ -281,6 +284,9 @@ tab1, tab2, tab3 = st.tabs(["📊 Crawl Report", "🧠 NLP Analysis", "🔍 Deep
 
 metrics, df = get_metrics()
 
+if not NLP_AVAILABLE:
+    st.error("⚠️ Library `google-cloud-language` not found. Please check requirements.txt")
+
 # TAB 1: CRAWL REPORT
 with tab1:
     if metrics:
@@ -305,73 +311,63 @@ with tab1:
 with tab2:
     st.subheader("Google Cloud Natural Language Analysis")
     
-    if metrics and google_auth_status:
-        # Select URL
+    if metrics and google_auth_status and NLP_AVAILABLE:
         selected_url = st.selectbox("Select a page to analyze:", df['url'].unique())
         
         if st.button("🚀 Analyze Page Content"):
             with st.spinner("Calling Google Cloud NLP API..."):
-                # Fetch text content from DB
                 col = get_db_collection()
                 doc = col.find_one({"url": selected_url}, {"page_text": 1})
                 text_content = doc.get('page_text', "") if doc else ""
                 
-                # Perform Analysis
                 results, error = analyze_content(text_content)
                 
                 if error:
                     st.error(f"Analysis Failed: {error}")
                 elif results:
-                    # 1. Sentiment
                     st.markdown("#### 1. Sentiment Analysis")
                     score = results['sentiment_score']
                     mag = results['sentiment_magnitude']
                     
-                    col_s1, col_s2, col_s3 = st.columns(3)
-                    with col_s1:
-                        st.metric("Sentiment Score", f"{score:.2f}", help="Range: -1.0 (Negative) to 1.0 (Positive)")
-                    with col_s2:
-                        st.metric("Magnitude", f"{mag:.2f}", help="Strength of emotion (0.0 to +inf)")
-                    with col_s3:
-                        if score > 0.25: st.success("Overall: Positive 😊")
-                        elif score < -0.25: st.error("Overall: Negative 😠")
-                        else: st.info("Overall: Neutral 😐")
+                    c1, c2, c3 = st.columns(3)
+                    with c1: st.metric("Sentiment Score", f"{score:.2f}")
+                    with c2: st.metric("Magnitude", f"{mag:.2f}")
+                    with c3:
+                        if score > 0.25: st.success("Positive 😊")
+                        elif score < -0.25: st.error("Negative 😠")
+                        else: st.info("Neutral 😐")
 
                     st.divider()
-
-                    # 2. Categories
                     st.markdown("#### 2. Content Classification")
                     if results['categories']:
                         for cat in results['categories']:
                             st.info(f"📂 **{cat.name}** (Confidence: {cat.confidence:.2f})")
                     else:
-                        st.caption("No specific categories classified (text might be too short or generic).")
+                        st.caption("No categories detected.")
                     
                     st.divider()
-
-                    # 3. Top Entities
                     st.markdown("#### 3. Key Entities Detected")
                     
-                    # Process entities into a clean dataframe
                     entity_data = []
                     for entity in results['entities']:
                         entity_data.append({
                             "Name": entity.name,
                             "Type": language_v1.Entity.Type(entity.type_).name,
-                            "Salience (Importance)": f"{entity.salience:.2%}"
+                            "Salience": f"{entity.salience:.2%}"
                         })
                     
                     if entity_data:
-                        # Sort by importance and take top 10
-                        entity_df = pd.DataFrame(entity_data).sort_values("Salience (Importance)", ascending=False).head(10)
+                        entity_df = pd.DataFrame(entity_data).sort_values("Salience", ascending=False).head(10)
                         st.table(entity_df)
                     else:
                         st.caption("No entities found.")
                         
     elif not google_auth_status:
         st.error("⚠️ Google Cloud Credentials not found. Please check your secrets.toml file.")
+    elif not NLP_AVAILABLE:
+        st.error("⚠️ NLP Library missing.")
     else:
-        st.warning("Please crawl the site first to generate data for analysis.")
+        st.warning("Please crawl the site first.")
 
 # TAB 3: DEEP SEARCH
 with tab3:
