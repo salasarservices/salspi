@@ -286,4 +286,192 @@ with st.sidebar:
             st.warning("Auth: Inactive")
 
     st.markdown("---")
-    target
+    
+    # --- INPUT FIELDS (Corrected) ---
+    target_url = st.text_input("Target URL", "https://example.com")
+    max_pages_limit = st.number_input("Max Pages", 10, 2000, 50)
+    
+    if st.button("Start Crawl", type="primary"):
+        crawl_site(target_url, max_pages_limit)
+        st.rerun()
+    
+    if st.button("Clear Database"):
+        coll = get_db_collection()
+        if coll is not None:
+            coll.delete_many({})
+            st.success("Database Cleared")
+            time.sleep(1)
+            st.rerun()
+
+# --- MAIN LOGIC ---
+tab1, tab2, tab3 = st.tabs(["Crawl Report", "Site Structure", "Deep Search"])
+
+col = get_db_collection()
+has_data = False
+if col is not None:
+    try:
+        if col.count_documents({}, limit=1) > 0:
+            has_data = True
+    except Exception:
+        has_data = False
+
+if has_data:
+    metrics_data, full_df = get_metrics()
+else:
+    metrics_data, full_df = None, None
+
+with tab1:
+    if metrics_data:
+        st.subheader("Site Health Overview")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: render_metric_card("Total Pages", metrics_data['total_pages'], full_df, "tot")
+        with c2: render_metric_card("Indexable", len(metrics_data['indexable']), metrics_data['indexable'], "idx")
+        with c3: render_metric_card("Non-Indexable", len(metrics_data['non_indexable']), metrics_data['non_indexable'], "nidx")
+        with c4: render_metric_card("Slow (>2s)", len(metrics_data['slow_pages']), metrics_data['slow_pages'], "slow")
+
+        st.subheader("Content Issues")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: render_metric_card("Dup. Content", len(metrics_data['duplicate_content']), metrics_data['duplicate_content'], "dup_c")
+        with c2: render_metric_card("Dup. Titles", len(metrics_data['duplicate_titles']), metrics_data['duplicate_titles'], "dup_t")
+        with c3: render_metric_card("Dup. Desc", len(metrics_data['duplicate_desc']), metrics_data['duplicate_desc'], "dup_d")
+        with c4: render_metric_card("Canonical Err", len(metrics_data['canonical_issues']), metrics_data['canonical_issues'], "canon")
+
+        st.subheader("Technical Issues")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: render_metric_card("Missing Alt", len(metrics_data['missing_alt']), metrics_data['missing_alt'], "alt")
+        with c2: render_metric_card("3xx Redirects", len(metrics_data['status_3xx']), metrics_data['status_3xx'], "3xx")
+        with c3: render_metric_card("4xx Errors", len(metrics_data['status_4xx']), metrics_data['status_4xx'], "4xx")
+        with c4: render_metric_card("5xx Errors", len(metrics_data['status_5xx']), metrics_data['status_5xx'], "5xx")
+    else:
+        st.info("No crawl data found. Enter a URL in the sidebar and click 'Start Crawl'.")
+
+# --- SITE STRUCTURE (STRICT TREE) ---
+with tab2:
+    if full_df is not None:
+        st.subheader("Site Architecture")
+        st.info("Visualizing clear parent-child relationships (Hub & Spoke Tree).")
+        
+        G = nx.DiGraph()
+        
+        # Root Identification
+        root_url = target_url if target_url in full_df['url'].values else full_df['url'].iloc[0]
+        
+        # BFS Traversal
+        queue = [root_url]
+        visited_in_tree = {root_url}
+        limit_nodes = 300
+        
+        # Add root
+        if not full_df[full_df['url'] == root_url].empty:
+            root_row = full_df[full_df['url'] == root_url].iloc[0]
+            G.add_node(root_url, label="Home", title=root_url, color="#0047AB", size=40)
+        
+        nodes_count = 1
+        
+        while queue and nodes_count < limit_nodes:
+            current_url = queue.pop(0)
+            
+            current_row = full_df[full_df['url'] == current_url]
+            if current_row.empty: continue
+            links = current_row.iloc[0]['links']
+            
+            if isinstance(links, list):
+                for link in links:
+                    if link in full_df['url'].values and link not in visited_in_tree:
+                        visited_in_tree.add(link)
+                        queue.append(link)
+                        nodes_count += 1
+                        
+                        link_row = full_df[full_df['url'] == link].iloc[0]
+                        node_color = "#4A90E2"
+                        if 300 <= link_row['status_code'] < 400: node_color = "#F5A623"
+                        elif link_row['status_code'] >= 400: node_color = "#D0021B"
+                        
+                        path_label = urlparse(link).path
+                        if path_label in ['', '/']: path_label = "Home"
+                        else: path_label = path_label.split('/')[-1][:15]
+                        
+                        G.add_node(link, label=path_label, title=link, color=node_color, size=20)
+                        G.add_edge(current_url, link, color="#888888")
+
+        if nodes_count >= limit_nodes:
+            st.warning(f"Tree limited to top {limit_nodes} pages for performance.")
+
+        # PyVis Configuration
+        net = Network(height='700px', width='100%', bgcolor='#ffffff', font_color='black', directed=True)
+        net.from_nx(G)
+        
+        options = {
+            "layout": {
+                "hierarchical": {
+                    "enabled": True,
+                    "direction": "UD", 
+                    "sortMethod": "directed",
+                    "nodeSpacing": 150,
+                    "levelSeparation": 150
+                }
+            },
+            "physics": {
+                "hierarchicalRepulsion": {
+                    "centralGravity": 0.0,
+                    "springLength": 100,
+                    "springConstant": 0.01,
+                    "nodeDistance": 120,
+                    "damping": 0.09
+                },
+                "solver": "hierarchicalRepulsion"
+            },
+            "edges": {
+                "smooth": {
+                    "type": "cubicBezier",
+                    "forceDirection": "vertical",
+                    "roundness": 0.4
+                },
+                "arrows": {
+                    "to": {"enabled": True, "scaleFactor": 1}
+                }
+            }
+        }
+        
+        net.set_options(json.dumps(options))
+        
+        path = tempfile.gettempdir() + "/network.html"
+        net.save_graph(path)
+        with open(path, 'r', encoding='utf-8') as f:
+            st.components.v1.html(f.read(), height=700)
+    else:
+        st.warning("Data needed for visualization.")
+
+# --- DEEP SEARCH ---
+with tab3:
+    st.subheader("Search Website Content")
+    st.markdown("Search for words inside the main content of crawled pages.")
+    
+    query = st.text_input("Enter search phrase:", placeholder="e.g. contact us")
+    
+    search_col = get_db_collection()
+    if query and search_col is not None:
+        try:
+            results = list(search_col.find(
+                {"page_text": {"$regex": query, "$options": "i"}},
+                {"url": 1, "page_text": 1, "_id": 0}
+            ).limit(50))
+            
+            if results:
+                st.success(f"✅ Found **{len(results)}** pages.")
+                search_data = []
+                for res in results:
+                    text = res.get('page_text', '')
+                    idx = text.lower().find(query.lower())
+                    if idx != -1:
+                        start = max(0, idx - 50)
+                        end = min(len(text), idx + len(query) + 50)
+                        snippet = "..." + text[start:end] + "..."
+                    else:
+                        snippet = "Match found (text hidden)"
+                    search_data.append({"URL": res['url'], "Context": snippet})
+                st.dataframe(pd.DataFrame(search_data), use_container_width=True)
+            else:
+                st.warning(f"No pages found containing '{query}'.")
+        except Exception as e:
+            st.error(f"Search failed: {e}")
