@@ -137,4 +137,102 @@ with tab1:
         display_metric_block("1.14 Thin Content (<200 words)", len(thin_content), thin_content, "#F7D9C4", ['url', 'word_count'])
 
         slow_pages = df[df['latency_ms'] > 1500]
-        display_metric_block("1.15 Slow Pages (> 1.5s)", len(slow_pages), slow_
+        display_metric_block("1.15 Slow Pages (> 1.5s)", len(slow_pages), slow_pages, "#D7E3FC", ['url', 'latency_ms'])
+    else:
+        st.info("No crawl data available. Please start a crawl from the sidebar.")
+
+# TAB 2: GOOGLE NLP
+with tab2:
+    if df is not None and google_auth_status and NLP_AVAILABLE:
+        from google.cloud import language_v1 
+        url_sel = st.selectbox("Select Page for G-NLP:", df['url'].unique(), key="gnlp_sel")
+        if st.button("Analyze with Google"):
+            doc = get_db_collection().find_one({"url": url_sel})
+            res, err = analyze_google(doc.get('page_text', ''))
+            if res:
+                s = res['sentiment']
+                c1, c2 = st.columns(2)
+                c1.metric("Sentiment", f"{s.score:.2f}")
+                c2.metric("Magnitude", f"{s.magnitude:.2f}")
+                ents = [{"Name": e.name, "Type": language_v1.Entity.Type(e.type_).name, "Salience": f"{e.salience:.1%}"} for e in res['entities'][:10]]
+                st.dataframe(pd.DataFrame(ents), use_container_width=True)
+            else: st.error(err)
+        
+        st.markdown("---")
+        comp_url_g = st.text_input("Competitor URL (Google):")
+        if st.button("Compare (Google)"):
+            doc = get_db_collection().find_one({"url": url_sel})
+            comp_txt, c_err = scrape_external_page(comp_url_g)
+            if doc and comp_txt:
+                res_in, _ = analyze_google(doc.get('page_text', ''))
+                res_ex, _ = analyze_google(comp_txt)
+                if res_in and res_ex:
+                    c1, c2 = st.columns(2)
+                    with c1: 
+                        st.subheader("Our Page")
+                        st.metric("Sentiment", f"{res_in['sentiment'].score:.2f}")
+                        st.dataframe(pd.DataFrame([{"Name": e.name, "Sal": f"{e.salience:.1%}"} for e in res_in['entities'][:5]]), use_container_width=True)
+                    with c2:
+                        st.subheader("Competitor")
+                        st.metric("Sentiment", f"{res_ex['sentiment'].score:.2f}")
+                        st.dataframe(pd.DataFrame([{"Name": e.name, "Sal": f"{e.salience:.1%}"} for e in res_ex['entities'][:5]]), use_container_width=True)
+
+# TAB 3: SEARCH
+with tab3:
+    q = st.text_input("Deep Search:")
+    if q and get_db_collection() is not None:
+        res = list(get_db_collection().find({"page_text": {"$regex": q, "$options": "i"}}).limit(20))
+        if res:
+            data = [{"URL": r['url'], "Match": "..." + r['page_text'][r['page_text'].lower().find(q.lower()):][:100] + "..."} for r in res]
+            st.dataframe(pd.DataFrame(data), use_container_width=True)
+
+# TAB 4: TEXTRAZOR
+with tab4:
+    if not TEXTRAZOR_AVAILABLE: st.error("Please install TextRazor.")
+    elif not textrazor_auth_status: st.error("Please add TextRazor API key.")
+    elif df is not None:
+        tr_url_sel = st.selectbox("Select Page for Analysis:", df['url'].unique(), key="tr_sel")
+        if st.button("Analyze Current Page (TextRazor)"):
+            doc = get_db_collection().find_one({"url": tr_url_sel})
+            with st.spinner("Processing..."):
+                resp, err = analyze_textrazor(doc.get('page_text', ''), textrazor_auth_status)
+                if resp:
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.markdown("#### Top Entities")
+                        ents = [{"ID": e.id, "Relevance": f"{e.relevance_score:.2f}"} for e in sorted(resp.entities(), key=lambda x: x.relevance_score, reverse=True)[:10]]
+                        st.dataframe(pd.DataFrame(ents), use_container_width=True)
+                    with c2:
+                        st.markdown("#### Top Topics")
+                        tops = [{"Label": t.label, "Score": f"{t.score:.2f}"} for t in sorted(resp.topics(), key=lambda x: x.score, reverse=True)[:10]]
+                        st.dataframe(pd.DataFrame(tops), use_container_width=True)
+                else: st.error(err)
+
+        st.markdown("---")
+        comp_url_tr = st.text_input("Enter Competitor URL:", key="tr_comp_input")
+        if st.button("Compare Pages (TextRazor)"):
+            doc = get_db_collection().find_one({"url": tr_url_sel})
+            with st.spinner("Analyzing..."):
+                text_a = doc.get('page_text', '')
+                text_b, err_b = scrape_external_page(comp_url_tr)
+                if text_a and text_b:
+                    resp_a, _ = analyze_textrazor(text_a, textrazor_auth_status)
+                    resp_b, _ = analyze_textrazor(text_b, textrazor_auth_status)
+                    if resp_a and resp_b:
+                        ents_a = {e.id for e in resp_a.entities()}
+                        ents_b = {e.id for e in resp_b.entities()}
+                        common = list(ents_a.intersection(ents_b))
+                        missing = list(ents_b - ents_a) 
+                        unique = list(ents_a - ents_b)
+                        c1, c2, c3 = st.columns(3)
+                        with c1:
+                            st.success(f"Common ({len(common)})")
+                            st.dataframe(pd.DataFrame(common, columns=["Entity"]), height=400, use_container_width=True)
+                        with c2:
+                            st.error(f"Missing ({len(missing)})")
+                            st.dataframe(pd.DataFrame(missing, columns=["Entity"]), height=400, use_container_width=True)
+                        with c3:
+                            st.info(f"Unique ({len(unique)})")
+                            st.dataframe(pd.DataFrame(unique, columns=["Entity"]), height=400, use_container_width=True)
+                    else: st.error(f"Analysis Failed.")
+                else: st.error("Failed to fetch page text.")
