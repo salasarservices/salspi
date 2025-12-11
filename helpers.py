@@ -11,66 +11,7 @@ import os
 import json
 import urllib3
 from datetime import datetime
-# Add this import at the top of helpers.py
-try:
-    import cloudscraper
-    SCRAPER_AVAILABLE = True
-except ImportError:
-    SCRAPER_AVAILABLE = False
 
-# ... keep your other imports ...
-
-# --- ROBUST SCRAPER (Fixed for Status 247/403) ---
-def scrape_external_page(url):
-    if not SCRAPER_AVAILABLE:
-        return None, "cloudscraper library missing. Install it via pip."
-        
-    try:
-        # Create a CloudScraper instance
-        # 'browser' param tells it to mimic a specific Chrome version
-        scraper = cloudscraper.create_scraper(
-            browser={
-                'browser': 'chrome',
-                'platform': 'windows',
-                'mobile': False
-            }
-        )
-        
-        # Make the request
-        resp = scraper.get(url, timeout=20)
-        
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            
-            # Clean up the soup
-            for s in soup(["script", "style", "nav", "footer", "iframe", "noscript"]): 
-                s.extract()
-                
-            text = soup.get_text(separator=' ', strip=True)
-            
-            # Basic check to see if we got actual content or a "Access Denied" page
-            if "Access Denied" in text[:50] or "Security Challenge" in text[:50]:
-                return None, "Blocked by Anti-Bot (Captcha Challenge)"
-                
-            return text, None
-        
-        return None, f"Failed to fetch: Status {resp.status_code}"
-        
-    except Exception as e:
-        # Fallback to standard requests if cloudscraper fails (rare)
-        try:
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            }
-            resp = requests.get(url, headers=headers, timeout=10, verify=False)
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                for s in soup(["script", "style"]): s.extract()
-                return soup.get_text(separator=' ', strip=True), None
-        except:
-            pass
-            
-        return None, f"Scraping Error: {str(e)}"
 # --- SAFE IMPORTS ---
 try:
     from google.cloud import language_v1
@@ -83,6 +24,13 @@ try:
     TEXTRAZOR_AVAILABLE = True
 except ImportError:
     TEXTRAZOR_AVAILABLE = False
+
+# Try to import cloudscraper for anti-bot bypass
+try:
+    import cloudscraper
+    SCRAPER_AVAILABLE = True
+except ImportError:
+    SCRAPER_AVAILABLE = False
 
 # Suppress SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -156,13 +104,8 @@ def crawl_site(start_url, max_pages):
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    # Updated headers to look like a real browser
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://www.google.com/'
-    }
+    # Standard headers for internal crawler
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
     
     while queue and count < max_pages:
         url = queue.pop(0)
@@ -267,32 +210,43 @@ def analyze_textrazor(text, auth_status):
         return response, None
     except Exception as e: return None, str(e)
 
-# --- ROBUST SCRAPER ---
+# --- ROBUST SCRAPER (FIXED FOR STATUS 247) ---
 def scrape_external_page(url):
+    # 1. Try CloudScraper (Best for Cloudflare/WAF)
+    if SCRAPER_AVAILABLE:
+        try:
+            scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False})
+            resp = scraper.get(url, timeout=20)
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, 'html.parser')
+                for s in soup(["script", "style", "nav", "footer", "iframe", "noscript"]): s.extract()
+                return soup.get_text(separator=' ', strip=True), None
+        except Exception:
+            pass # Fallback to requests if cloudscraper fails
+
+    # 2. Fallback: Requests with Real Browser Headers
     try:
-        # FAKE HEADERS: Makes the request look like a real Chrome browser on Windows
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
             'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
             'Upgrade-Insecure-Requests': '1',
-            'Referer': 'https://www.google.com/'
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0'
         }
         
-        # Use a session to handle cookies/redirects better
         session = requests.Session()
         resp = session.get(url, headers=headers, timeout=15, verify=False)
         
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, 'html.parser')
-            # Remove distracting elements
-            for s in soup(["script", "style", "nav", "footer", "iframe"]): 
-                s.extract()
+            for s in soup(["script", "style", "nav", "footer", "iframe", "noscript"]): s.extract()
             return soup.get_text(separator=' ', strip=True), None
-        
-        # If blocked (403/247/406), return the status
+            
         return None, f"Failed to fetch: Status {resp.status_code}"
-        
     except Exception as e: return None, str(e)
