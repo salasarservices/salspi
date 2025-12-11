@@ -66,33 +66,23 @@ def display_metric_block(title, count, df_data, color_hex, display_cols):
     </div>""", unsafe_allow_html=True)
     
     if count > 0:
-        # UPDATED: Removed "Show Top 10" from title
         with st.expander(f"Show Details for {title}"):
-            # Prepare the data
             if isinstance(df_data, list):
-                # UPDATED: No longer limiting with .head(10)
                 df_display = pd.DataFrame(df_data)
             elif isinstance(df_data, pd.DataFrame):
                 valid_cols = [c for c in display_cols if c in df_data.columns]
-                # UPDATED: No longer limiting with .head(10)
                 df_display = df_data[valid_cols]
             else:
                 return
 
-            # Configure Clickable Links
+            # Configure Clickable Links (UPDATED)
             column_config = {}
+            # Using None for display_text defaults to showing the URL itself
             if 'url' in df_display.columns:
-                column_config['url'] = st.column_config.LinkColumn(
-                    "URL", display_text="Open Link"
-                )
+                column_config['url'] = st.column_config.LinkColumn("URL")
             if 'Page' in df_display.columns:
-                column_config['Page'] = st.column_config.LinkColumn(
-                    "Page", display_text="Open Page"
-                )
+                column_config['Page'] = st.column_config.LinkColumn("Page")
 
-            # Display Full Dataframe
-            # Streamlit handles the "Top 10 view" via scroll height automatically.
-            # The user can click the "maximize" button on the table to see all rows.
             st.dataframe(
                 df_display, 
                 width="stretch", 
