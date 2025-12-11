@@ -33,52 +33,29 @@ st.set_page_config(page_title="SeoSpider Pro", page_icon="🕸️", layout="wide
 
 st.markdown("""
 <style>
-    /* Metric Cards */
-    div[data-testid="metric-container"] {
-        background-color: #F0F4F8; 
-        border: 1px solid #D9E2EC;
-        padding: 15px;
-        border-radius: 10px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-        color: #102A43;
-        transition: transform 0.2s;
-    }
-    div[data-testid="metric-container"]:hover {
-        transform: translateY(-2px);
-    }
-    div[data-testid="metric-container"] label {
-        color: #486581; 
-        font-size: 1rem !important;
-        font-weight: 600 !important; 
-    }
-    div[data-testid="metric-container"] div[data-testid="stMetricValue"] {
-        color: #102A43;
-        font-size: 2.2rem !important; 
-        font-weight: 800 !important; 
-    }
-    
     /* Tabs */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 8px;
-    }
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
     .stTabs [data-baseweb="tab"] {
-        background-color: #ffffff;
-        border-radius: 4px;
-        padding: 10px 20px;
-        border: 1px solid #f0f0f0;
+        background-color: #ffffff; border-radius: 4px; padding: 10px 20px; border: 1px solid #f0f0f0;
     }
     .stTabs [aria-selected="true"] {
-        background-color: #E3F2FD !important;
-        color: #000000 !important;
-        border-color: #90CDF4 !important;
+        background-color: #E3F2FD !important; color: #000000 !important; border-color: #90CDF4 !important;
     }
     
-    /* Table Headers */
-    th {
-        font-weight: 800 !important;
-        color: #102A43 !important;
-        font-size: 1.05rem !important;
+    /* Custom Pastel Metric Card Styling */
+    .metric-card {
+        padding: 20px;
+        border-radius: 12px;
+        margin-bottom: 10px;
+        border: 1px solid rgba(0,0,0,0.05);
+        color: #333;
     }
+    .metric-title { font-size: 1.1rem; font-weight: 600; margin-bottom: 5px; opacity: 0.8; }
+    .metric-value { font-size: 2.5rem; font-weight: 800; margin-bottom: 0; }
+    .metric-desc { font-size: 0.9rem; opacity: 0.7; margin-bottom: 10px; }
+    
+    /* Table Styling for 'Top 10' */
+    div[data-testid="stDataFrame"] { width: 100%; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -123,8 +100,7 @@ def init_mongo_connection():
 def get_db_collection():
     client = init_mongo_connection()
     if client:
-        try:
-            return client[st.secrets["mongo"]["db"]][st.secrets["mongo"]["collection"]]
+        try: return client[st.secrets["mongo"]["db"]][st.secrets["mongo"]["collection"]]
         except KeyError: return None
     return None
 
@@ -178,7 +154,7 @@ def crawl_site(start_url, max_pages):
                 "url": final_url, "domain": base_domain, "status_code": response.status_code,
                 "content_type": response.headers.get('Content-Type', ''), "crawl_time": datetime.now(),
                 "latency_ms": latency, "links": [], "images": [], "title": "", "meta_desc": "",
-                "canonical": "", "page_text": "", "content_hash": "", "indexable": True
+                "canonical": "", "page_text": "", "content_hash": "", "indexable": True, "h1_count": 0, "word_count": 0
             }
 
             if response.status_code == 200 and 'text/html' in page_data['content_type']:
@@ -189,10 +165,14 @@ def crawl_site(start_url, max_pages):
                 canon = soup.find('link', rel='canonical')
                 page_data['canonical'] = canon['href'] if canon else ""
                 
+                # H1 Count
+                page_data['h1_count'] = len(soup.find_all('h1'))
+                
                 for s in soup(["script", "style"]): s.extract()
                 text_content = soup.get_text(separator=' ', strip=True)
                 page_data['page_text'] = text_content
                 page_data['content_hash'] = get_page_hash(text_content)
+                page_data['word_count'] = len(text_content.split())
                 
                 for img in soup.find_all('img'):
                     if img.get('src'):
@@ -224,50 +204,22 @@ def get_metrics():
     df = pd.DataFrame(data)
     if df.empty: return None, None
     
-    cols = ['url', 'title', 'meta_desc', 'canonical', 'images', 'status_code', 'content_hash', 'latency_ms', 'indexable']
+    cols = ['url', 'title', 'meta_desc', 'canonical', 'images', 'status_code', 'content_hash', 'latency_ms', 'indexable', 'h1_count', 'word_count']
     for c in cols: 
         if c not in df.columns: df[c] = None
-    
-    # Fill NaNs safely
+        
+    # Fill NaNs
     df['title'] = df['title'].fillna("")
     df['meta_desc'] = df['meta_desc'].fillna("")
     df['content_hash'] = df['content_hash'].fillna("")
     df['canonical'] = df['canonical'].fillna("")
     df['latency_ms'] = pd.to_numeric(df['latency_ms'], errors='coerce').fillna(0)
+    df['h1_count'] = pd.to_numeric(df['h1_count'], errors='coerce').fillna(0)
+    df['word_count'] = pd.to_numeric(df['word_count'], errors='coerce').fillna(0)
     
-    metrics = {
-        'total_pages': len(df),
-        'dup_content_count': len(df[df.duplicated(subset=['content_hash'], keep=False) & (df['content_hash'] != "")]),
-        'dup_title_count': len(df[df.duplicated(subset=['title'], keep=False) & (df['title'] != "")]),
-        'dup_desc_count': len(df[df.duplicated(subset=['meta_desc'], keep=False) & (df['meta_desc'] != "")]),
-        'broken_count': len(df[df['status_code'] == 404]),
-        '3xx_count': len(df[(df['status_code'] >= 300) & (df['status_code'] < 400)]),
-        '4xx_count': len(df[(df['status_code'] >= 400) & (df['status_code'] < 500)]),
-        '5xx_count': len(df[df['status_code'] >= 500]),
-        'indexable_count': len(df[df['indexable'] == True]),
-        'non_indexable_count': len(df[df['indexable'] == False]),
-        'slow_pages_count': len(df[df['latency_ms'] > 1500])
-    }
-    
-    # FIXED: Check canonical strictly ensuring return is boolean
-    def check_canonical(row):
-        if not row['canonical']: 
-            return False
-        return row['canonical'] != row['url']
-        
-    metrics['canon_issues_count'] = len(df[df.apply(check_canonical, axis=1)])
-    
-    missing_alt = 0
-    for _, row in df.iterrows():
-        if isinstance(row['images'], list):
-            for img in row['images']:
-                if not img.get('alt'):
-                    missing_alt += 1
-                    break
-    metrics['missing_alt_count'] = missing_alt
-    return metrics, df
+    return df
 
-# --- NLP ENGINE (GOOGLE) ---
+# --- NLP ENGINE ---
 def analyze_content(text):
     if not NLP_AVAILABLE: return None, "Library missing."
     try:
@@ -285,12 +237,10 @@ def analyze_textrazor(text):
     if not textrazor_auth_status: return None, "TextRazor API Key missing."
     try:
         client = textrazor.TextRazor(extractors=["entities", "topics"])
-        # Clean text slightly to avoid API errors on empty input
         if not text or len(text.strip()) < 50: return None, "Text too short for TextRazor."
         response = client.analyze(text)
         return response, None
-    except Exception as e:
-        return None, str(e)
+    except Exception as e: return None, str(e)
 
 # --- SCRAPER ---
 def scrape_external_page(url):
@@ -303,6 +253,28 @@ def scrape_external_page(url):
             return soup.get_text(separator=' ', strip=True), None
         return None, f"Status {resp.status_code}"
     except Exception as e: return None, str(e)
+
+# --- HELPER: DISPLAY METRIC CARD ---
+def display_metric_block(title, count, df_data, color_hex, display_cols):
+    """
+    Renders a custom HTML block with pastel background and a dataframe expansion below.
+    """
+    st.markdown(f"""
+    <div class="metric-card" style="background-color: {color_hex};">
+        <div class="metric-title">{title}</div>
+        <div class="metric-value">{count}</div>
+        <div class="metric-desc">Showing top results below</div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    if count > 0:
+        with st.expander(f"Show Top 10 {title}"):
+            if isinstance(df_data, pd.DataFrame):
+                # Filter to specific columns if they exist
+                valid_cols = [c for c in display_cols if c in df_data.columns]
+                st.dataframe(df_data[valid_cols].head(10), use_container_width=True)
+            elif isinstance(df_data, list):
+                st.dataframe(pd.DataFrame(df_data).head(10), use_container_width=True)
 
 # --- SIDEBAR ---
 with st.sidebar:
@@ -330,20 +302,93 @@ with st.sidebar:
 
 # --- MAIN APP ---
 tab1, tab2, tab3, tab4 = st.tabs(["📊 SEO Report", "🧠 NLP Analysis", "🔍 Search", "📄 Content Analysis"])
-metrics, df = get_metrics()
+df = get_metrics()
 
-# TAB 1: SEO REPORT
+# TAB 1: SEO REPORT (REDESIGNED)
 with tab1:
-    if metrics:
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total Pages", metrics['total_pages'])
-        c2.metric("Indexable", metrics['indexable_count'])
-        c3.metric("Broken (404)", metrics['broken_count'])
-        c4.metric("Slow Pages", metrics['slow_pages_count'])
+    if df is not None:
+        st.subheader("Site Health Overview")
         
-        # Display DataFrame
-        st.dataframe(df, width=2000)
-    else: st.info("Start a crawl first.")
+        # 1.2 Duplicate Content
+        dup_content = df[df.duplicated(subset=['content_hash'], keep=False) & (df['content_hash'] != "")]
+        display_metric_block("1.2 Duplicate Content Pages", len(dup_content), dup_content, "#FFB3BA", ['url', 'title'])
+
+        col1, col2 = st.columns(2)
+        with col1:
+            # 1.3 Duplicate Titles
+            dup_title = df[df.duplicated(subset=['title'], keep=False) & (df['title'] != "")]
+            display_metric_block("1.3 Duplicate Meta Titles", len(dup_title), dup_title, "#FFDFBA", ['url', 'title'])
+        with col2:
+            # 1.4 Duplicate Desc
+            dup_desc = df[df.duplicated(subset=['meta_desc'], keep=False) & (df['meta_desc'] != "")]
+            display_metric_block("1.4 Duplicate Meta Desc", len(dup_desc), dup_desc, "#FFFFBA", ['url', 'meta_desc'])
+
+        col3, col4 = st.columns(2)
+        with col3:
+            # 1.5 Canonical Issues
+            def check_canonical(row):
+                if not row['canonical']: return False
+                return row['canonical'] != row['url']
+            canon_issues = df[df.apply(check_canonical, axis=1)]
+            display_metric_block("1.5 Canonical Issues", len(canon_issues), canon_issues, "#BAFFC9", ['url', 'canonical'])
+        with col4:
+            # 1.6 Missing Alt Tags
+            missing_alt_data = []
+            for _, row in df.iterrows():
+                if isinstance(row['images'], list):
+                    for img in row['images']:
+                        if not img.get('alt'):
+                            missing_alt_data.append({'Page': row['url'], 'Image Src': img.get('src')})
+            display_metric_block("1.6 Missing Alt Tags", len(missing_alt_data), missing_alt_data, "#BAE1FF", ['Page', 'Image Src'])
+
+        # 1.7 Broken Links (Using 404 as broken for simplicity in crawl report)
+        # Note: Crawlers usually report broken links based on response code 404
+        
+        col5, col6, col7, col8 = st.columns(4)
+        with col5:
+             # 1.7 Broken Links (Proxy: 404 pages found during crawl)
+             broken = df[df['status_code'] == 404]
+             display_metric_block("1.7 Broken Pages (404)", len(broken), broken, "#FFCCE5", ['url', 'status_code'])
+        with col6:
+            # 1.8 300 Responses
+            r300 = df[(df['status_code'] >= 300) & (df['status_code'] < 400)]
+            display_metric_block("1.8 3xx Redirects", len(r300), r300, "#E2B3FF", ['url', 'status_code'])
+        with col7:
+            # 1.9 400 Responses (General 4xx excluding 404 if needed, or all 4xx)
+            r400 = df[(df['status_code'] >= 400) & (df['status_code'] < 500)]
+            display_metric_block("1.9 4xx Errors", len(r400), r400, "#FF9AA2", ['url', 'status_code'])
+        with col8:
+             # 1.10 500 Responses
+             r500 = df[df['status_code'] >= 500]
+             display_metric_block("1.10 5xx Errors", len(r500), r500, "#C7CEEA", ['url', 'status_code'])
+
+        col9, col10 = st.columns(2)
+        with col9:
+            # 1.11 Indexable
+            indexable = df[df['indexable'] == True]
+            display_metric_block("1.11 Indexable Pages", len(indexable), indexable, "#B5EAD7", ['url', 'title'])
+        with col10:
+             # 1.12 Non-Indexable
+            non_indexable = df[df['indexable'] == False]
+            display_metric_block("1.12 Non-Indexable Pages", len(non_indexable), non_indexable, "#FFDAC1", ['url', 'title'])
+
+        # 1.13 On-Page Changes (Proxy: Heading Analysis)
+        # Identify changes requires history. For now, identifying "Issues" with metadata/headings.
+        # e.g., Missing H1 or Multiple H1
+        h1_issues = df[(df['h1_count'] == 0) | (df['h1_count'] > 1)]
+        display_metric_block("1.13 On-Page Heading Issues (0 or >1 H1)", len(h1_issues), h1_issues, "#E2F0CB", ['url', 'h1_count'])
+
+        # 1.14 Content Issues (Proxy: Thin Content / Low Word Count)
+        # "Changes" require history. "Spelling" requires heavy library. Using Word Count < 200 as issue.
+        thin_content = df[df['word_count'] < 200]
+        display_metric_block("1.14 Content Issues (Thin Content <200 words)", len(thin_content), thin_content, "#F7D9C4", ['url', 'word_count'])
+
+        # 1.15 PageSpeed (Proxy: Latency > 1.5s)
+        slow_pages = df[df['latency_ms'] > 1500]
+        display_metric_block("1.15 PageSpeed Opportunities (Slow > 1.5s)", len(slow_pages), slow_pages, "#D7E3FC", ['url', 'latency_ms'])
+
+    else:
+        st.info("No crawl data available. Please start a crawl from the sidebar.")
 
 # TAB 2: GOOGLE NLP
 with tab2:
@@ -359,7 +404,7 @@ with tab2:
                 c1.metric("Sentiment", f"{s.score:.2f}")
                 c2.metric("Magnitude", f"{s.magnitude:.2f}")
                 ents = [{"Name": e.name, "Type": language_v1.Entity.Type(e.type_).name, "Salience": f"{e.salience:.1%}"} for e in res['entities'][:10]]
-                st.dataframe(pd.DataFrame(ents), width=2000)
+                st.dataframe(pd.DataFrame(ents), use_container_width=True)
             else: st.error(err)
         
         st.markdown("---")
@@ -376,11 +421,11 @@ with tab2:
                     with c1: 
                         st.subheader("Our Page")
                         st.metric("Sentiment", f"{res_in['sentiment'].score:.2f}")
-                        st.dataframe(pd.DataFrame([{"Name": e.name, "Sal": f"{e.salience:.1%}"} for e in res_in['entities'][:5]]), width=500)
+                        st.dataframe(pd.DataFrame([{"Name": e.name, "Sal": f"{e.salience:.1%}"} for e in res_in['entities'][:5]]), use_container_width=True)
                     with c2:
                         st.subheader("Competitor")
                         st.metric("Sentiment", f"{res_ex['sentiment'].score:.2f}")
-                        st.dataframe(pd.DataFrame([{"Name": e.name, "Sal": f"{e.salience:.1%}"} for e in res_ex['entities'][:5]]), width=500)
+                        st.dataframe(pd.DataFrame([{"Name": e.name, "Sal": f"{e.salience:.1%}"} for e in res_ex['entities'][:5]]), use_container_width=True)
 
 # TAB 3: SEARCH
 with tab3:
@@ -389,7 +434,7 @@ with tab3:
         res = list(get_db_collection().find({"page_text": {"$regex": q, "$options": "i"}}).limit(20))
         if res:
             data = [{"URL": r['url'], "Match": "..." + r['page_text'][r['page_text'].lower().find(q.lower()):][:100] + "..."} for r in res]
-            st.dataframe(pd.DataFrame(data), width=2000)
+            st.dataframe(pd.DataFrame(data), use_container_width=True)
 
 # TAB 4: TEXTRAZOR ANALYSIS
 with tab4:
@@ -411,11 +456,11 @@ with tab4:
                     with c1:
                         st.markdown("#### Top Entities")
                         ents = [{"ID": e.id, "Relevance": f"{e.relevance_score:.2f}", "Confidence": f"{e.confidence_score:.2f}"} for e in sorted(resp.entities(), key=lambda x: x.relevance_score, reverse=True)[:10]]
-                        st.dataframe(pd.DataFrame(ents), width=600)
+                        st.dataframe(pd.DataFrame(ents), use_container_width=True)
                     with c2:
                         st.markdown("#### Top Topics")
                         tops = [{"Label": t.label, "Score": f"{t.score:.2f}"} for t in sorted(resp.topics(), key=lambda x: x.score, reverse=True)[:10]]
-                        st.dataframe(pd.DataFrame(tops), width=600)
+                        st.dataframe(pd.DataFrame(tops), use_container_width=True)
                 else:
                     st.error(err)
 
@@ -430,40 +475,31 @@ with tab4:
             else:
                 doc = get_db_collection().find_one({"url": tr_url_sel})
                 with st.spinner("Scraping & Analyzing both pages..."):
-                    # 1. Get Texts
                     text_a = doc.get('page_text', '')
                     text_b, err_b = scrape_external_page(comp_url_tr)
                     
                     if text_a and text_b:
-                        # 2. Analyze Both
                         resp_a, err_a = analyze_textrazor(text_a)
                         resp_b, err_b = analyze_textrazor(text_b)
                         
                         if resp_a and resp_b:
-                            # 3. Extract Entity IDs
                             ents_a = {e.id for e in resp_a.entities()}
                             ents_b = {e.id for e in resp_b.entities()}
                             
                             common = list(ents_a.intersection(ents_b))
-                            missing = list(ents_b - ents_a) # They have, we don't
-                            unique = list(ents_a - ents_b)  # We have, they don't
+                            missing = list(ents_b - ents_a) 
+                            unique = list(ents_a - ents_b)
                             
-                            # 4. Display
                             c1, c2, c3 = st.columns(3)
-                            
                             with c1:
-                                st.success(f"✅ Common Entities ({len(common)})")
-                                st.dataframe(pd.DataFrame(common, columns=["Entity ID"]), height=400, width=400)
-                                
+                                st.success(f"✅ Common ({len(common)})")
+                                st.dataframe(pd.DataFrame(common, columns=["Entity ID"]), height=400, use_container_width=True)
                             with c2:
-                                st.error(f"⚠️ Content Gap (Missing) ({len(missing)})")
-                                st.caption("Entities found in competitor but NOT in your page.")
-                                st.dataframe(pd.DataFrame(missing, columns=["Entity ID"]), height=400, width=400)
-                                
+                                st.error(f"⚠️ Missing ({len(missing)})")
+                                st.dataframe(pd.DataFrame(missing, columns=["Entity ID"]), height=400, use_container_width=True)
                             with c3:
-                                st.info(f"🔹 Your Unique Edge ({len(unique)})")
-                                st.caption("Entities found in your page but NOT in competitor.")
-                                st.dataframe(pd.DataFrame(unique, columns=["Entity ID"]), height=400, width=400)
+                                st.info(f"🔹 Unique ({len(unique)})")
+                                st.dataframe(pd.DataFrame(unique, columns=["Entity ID"]), height=400, use_container_width=True)
                         else:
                             st.error(f"Analysis Failed. Internal: {err_a}, External: {err_b}")
                     else:
