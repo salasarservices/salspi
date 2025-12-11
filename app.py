@@ -227,8 +227,14 @@ def get_metrics():
     cols = ['url', 'title', 'meta_desc', 'canonical', 'images', 'status_code', 'content_hash', 'latency_ms', 'indexable']
     for c in cols: 
         if c not in df.columns: df[c] = None
-        
+    
+    # Fill NaNs safely
+    df['title'] = df['title'].fillna("")
+    df['meta_desc'] = df['meta_desc'].fillna("")
+    df['content_hash'] = df['content_hash'].fillna("")
+    df['canonical'] = df['canonical'].fillna("")
     df['latency_ms'] = pd.to_numeric(df['latency_ms'], errors='coerce').fillna(0)
+    
     metrics = {
         'total_pages': len(df),
         'dup_content_count': len(df[df.duplicated(subset=['content_hash'], keep=False) & (df['content_hash'] != "")]),
@@ -243,7 +249,12 @@ def get_metrics():
         'slow_pages_count': len(df[df['latency_ms'] > 1500])
     }
     
-    def check_canonical(row): return row['canonical'] and row['canonical'] != row['url']
+    # FIXED: Check canonical strictly ensuring return is boolean
+    def check_canonical(row):
+        if not row['canonical']: 
+            return False
+        return row['canonical'] != row['url']
+        
     metrics['canon_issues_count'] = len(df[df.apply(check_canonical, axis=1)])
     
     missing_alt = 0
@@ -329,6 +340,8 @@ with tab1:
         c2.metric("Indexable", metrics['indexable_count'])
         c3.metric("Broken (404)", metrics['broken_count'])
         c4.metric("Slow Pages", metrics['slow_pages_count'])
+        
+        # Display DataFrame
         st.dataframe(df, width=2000)
     else: st.info("Start a crawl first.")
 
