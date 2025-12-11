@@ -62,36 +62,37 @@ def display_metric_block(title, count, df_data, color_hex, display_cols):
     <div class="metric-card" style="background-color: {color_hex};">
         <div class="metric-title">{title}</div>
         <div class="metric-value">{count}</div>
-        <div class="metric-desc">Showing top results below</div>
+        <div class="metric-desc">Click dropdown to view details</div>
     </div>""", unsafe_allow_html=True)
     
     if count > 0:
-        with st.expander(f"Show Top 10 {title}"):
+        # UPDATED: Removed "Show Top 10" from title
+        with st.expander(f"Show Details for {title}"):
             # Prepare the data
             if isinstance(df_data, list):
-                df_display = pd.DataFrame(df_data).head(10)
+                # UPDATED: No longer limiting with .head(10)
+                df_display = pd.DataFrame(df_data)
             elif isinstance(df_data, pd.DataFrame):
                 valid_cols = [c for c in display_cols if c in df_data.columns]
-                df_display = df_data[valid_cols].head(10)
+                # UPDATED: No longer limiting with .head(10)
+                df_display = df_data[valid_cols]
             else:
                 return
 
             # Configure Clickable Links
             column_config = {}
-            
-            # If 'url' column exists, make it a clickable link
             if 'url' in df_display.columns:
                 column_config['url'] = st.column_config.LinkColumn(
                     "URL", display_text="Open Link"
                 )
-            
-            # If 'Page' column exists (used in Missing Alt Tags), make it clickable
             if 'Page' in df_display.columns:
                 column_config['Page'] = st.column_config.LinkColumn(
                     "Page", display_text="Open Page"
                 )
 
-            # Display with width='stretch' and link configuration
+            # Display Full Dataframe
+            # Streamlit handles the "Top 10 view" via scroll height automatically.
+            # The user can click the "maximize" button on the table to see all rows.
             st.dataframe(
                 df_display, 
                 width="stretch", 
