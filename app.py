@@ -3,7 +3,7 @@ import pandas as pd
 from helpers import (
     setup_google_auth, setup_textrazor_auth, init_mongo_connection, 
     get_db_collection, crawl_site, get_metrics_df, analyze_google, 
-    analyze_textrazor, NLP_AVAILABLE, TEXTRAZOR_AVAILABLE
+    analyze_textrazor, scrape_external_page, NLP_AVAILABLE, TEXTRAZOR_AVAILABLE
 )
 
 # --- CONFIG ---
@@ -47,13 +47,13 @@ with st.sidebar:
     else: st.warning("TextRazor: Inactive")
 
     st.markdown("---")
-    # Simplified Control Panel
     target_url = st.text_input("Target URL", "https://example.com")
-    st.caption("Default Crawl Limit: 1000 Pages")
-    
+    max_pages = st.number_input("Max Pages", 10, 500, 50)
     if st.button("Start Crawl", type="primary"):
-        # Crawl now auto-clears DB and handles 1000 page limit
-        crawl_site(target_url)
+        crawl_site(target_url, max_pages)
+        st.rerun()
+    if st.button("Clear DB"):
+        get_db_collection().delete_many({})
         st.rerun()
 
 # --- HELPER UI ---
@@ -64,13 +64,40 @@ def display_metric_block(title, count, df_data, color_hex, display_cols):
         <div class="metric-value">{count}</div>
         <div class="metric-desc">Showing top results below</div>
     </div>""", unsafe_allow_html=True)
+    
     if count > 0:
         with st.expander(f"Show Top 10 {title}"):
-            if isinstance(df_data, pd.DataFrame):
+            # Prepare the data
+            if isinstance(df_data, list):
+                df_display = pd.DataFrame(df_data).head(10)
+            elif isinstance(df_data, pd.DataFrame):
                 valid_cols = [c for c in display_cols if c in df_data.columns]
-                st.dataframe(df_data[valid_cols].head(10), width="stretch")
-            elif isinstance(df_data, list):
-                st.dataframe(pd.DataFrame(df_data).head(10), width="stretch")
+                df_display = df_data[valid_cols].head(10)
+            else:
+                return
+
+            # Configure Clickable Links
+            column_config = {}
+            
+            # If 'url' column exists, make it a clickable link
+            if 'url' in df_display.columns:
+                column_config['url'] = st.column_config.LinkColumn(
+                    "URL", display_text="Open Link"
+                )
+            
+            # If 'Page' column exists (used in Missing Alt Tags), make it clickable
+            if 'Page' in df_display.columns:
+                column_config['Page'] = st.column_config.LinkColumn(
+                    "Page", display_text="Open Page"
+                )
+
+            # Display with width='stretch' and link configuration
+            st.dataframe(
+                df_display, 
+                width="stretch", 
+                column_config=column_config,
+                hide_index=True
+            )
 
 # --- MAIN UI ---
 tab1, tab2, tab3, tab4 = st.tabs(["📊 SEO Report", "🧠 NLP Analysis", "🔍 Search", "📄 Content Analysis"])
@@ -81,17 +108,17 @@ with tab1:
     if df is not None:
         st.subheader("Site Health Overview")
         
-        # 1.2 Duplicate Content
+        # Duplicate Content
         dup_content = df[df.duplicated(subset=['content_hash'], keep=False) & (df['content_hash'] != "")]
-        display_metric_block("1.2 Duplicate Content Pages", len(dup_content), dup_content, "#FFB3BA", ['url', 'title'])
+        display_metric_block("Duplicate Content Pages", len(dup_content), dup_content, "#FFB3BA", ['url', 'title'])
 
         col1, col2 = st.columns(2)
         with col1:
             dup_title = df[df.duplicated(subset=['title'], keep=False) & (df['title'] != "")]
-            display_metric_block("1.3 Duplicate Meta Titles", len(dup_title), dup_title, "#FFDFBA", ['url', 'title'])
+            display_metric_block("Duplicate Meta Titles", len(dup_title), dup_title, "#FFDFBA", ['url', 'title'])
         with col2:
             dup_desc = df[df.duplicated(subset=['meta_desc'], keep=False) & (df['meta_desc'] != "")]
-            display_metric_block("1.4 Duplicate Meta Desc", len(dup_desc), dup_desc, "#FFFFBA", ['url', 'meta_desc'])
+            display_metric_block("Duplicate Meta Desc", len(dup_desc), dup_desc, "#FFFFBA", ['url', 'meta_desc'])
 
         col3, col4 = st.columns(2)
         with col3:
@@ -99,45 +126,45 @@ with tab1:
                 if not row['canonical']: return False
                 return row['canonical'] != row['url']
             canon_issues = df[df.apply(check_canonical, axis=1)]
-            display_metric_block("1.5 Canonical Issues", len(canon_issues), canon_issues, "#BAFFC9", ['url', 'canonical'])
+            display_metric_block("Canonical Issues", len(canon_issues), canon_issues, "#BAFFC9", ['url', 'canonical'])
         with col4:
             missing_alt_data = []
             for _, row in df.iterrows():
                 if isinstance(row['images'], list):
                     for img in row['images']:
                         if not img.get('alt'): missing_alt_data.append({'Page': row['url'], 'Image Src': img.get('src')})
-            display_metric_block("1.6 Missing Alt Tags", len(missing_alt_data), missing_alt_data, "#BAE1FF", ['Page', 'Image Src'])
+            display_metric_block("Missing Alt Tags", len(missing_alt_data), missing_alt_data, "#BAE1FF", ['Page', 'Image Src'])
 
         col5, col6, col7, col8 = st.columns(4)
         with col5:
              broken = df[df['status_code'] == 404]
-             display_metric_block("1.7 Broken Pages (404)", len(broken), broken, "#FFCCE5", ['url', 'status_code'])
+             display_metric_block("Broken Pages (404)", len(broken), broken, "#FFCCE5", ['url', 'status_code'])
         with col6:
             r300 = df[(df['status_code'] >= 300) & (df['status_code'] < 400)]
-            display_metric_block("1.8 3xx Redirects", len(r300), r300, "#E2B3FF", ['url', 'status_code'])
+            display_metric_block("3xx Redirects", len(r300), r300, "#E2B3FF", ['url', 'status_code'])
         with col7:
             r400 = df[(df['status_code'] >= 400) & (df['status_code'] < 500)]
-            display_metric_block("1.9 4xx Errors", len(r400), r400, "#FF9AA2", ['url', 'status_code'])
+            display_metric_block("4xx Errors", len(r400), r400, "#FF9AA2", ['url', 'status_code'])
         with col8:
              r500 = df[df['status_code'] >= 500]
-             display_metric_block("1.10 5xx Errors", len(r500), r500, "#C7CEEA", ['url', 'status_code'])
+             display_metric_block("5xx Errors", len(r500), r500, "#C7CEEA", ['url', 'status_code'])
 
         col9, col10 = st.columns(2)
         with col9:
             indexable = df[df['indexable'] == True]
-            display_metric_block("1.11 Indexable Pages", len(indexable), indexable, "#B5EAD7", ['url', 'title'])
+            display_metric_block("Indexable Pages", len(indexable), indexable, "#B5EAD7", ['url', 'title'])
         with col10:
             non_indexable = df[df['indexable'] == False]
-            display_metric_block("1.12 Non-Indexable Pages", len(non_indexable), non_indexable, "#FFDAC1", ['url', 'title'])
+            display_metric_block("Non-Indexable Pages", len(non_indexable), non_indexable, "#FFDAC1", ['url', 'title'])
 
         h1_issues = df[(df['h1_count'] == 0) | (df['h1_count'] > 1)]
-        display_metric_block("1.13 On-Page Heading Issues", len(h1_issues), h1_issues, "#E2F0CB", ['url', 'h1_count'])
+        display_metric_block("On-Page Heading Issues", len(h1_issues), h1_issues, "#E2F0CB", ['url', 'h1_count'])
 
         thin_content = df[df['word_count'] < 200]
-        display_metric_block("1.14 Thin Content (<200 words)", len(thin_content), thin_content, "#F7D9C4", ['url', 'word_count'])
+        display_metric_block("Thin Content (<200 words)", len(thin_content), thin_content, "#F7D9C4", ['url', 'word_count'])
 
         slow_pages = df[df['latency_ms'] > 1500]
-        display_metric_block("1.15 Slow Pages (> 1.5s)", len(slow_pages), slow_pages, "#D7E3FC", ['url', 'latency_ms'])
+        display_metric_block("Slow Pages (> 1.5s)", len(slow_pages), slow_pages, "#D7E3FC", ['url', 'latency_ms'])
     else:
         st.info("No crawl data available. Please start a crawl from the sidebar.")
 
