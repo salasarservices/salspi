@@ -15,6 +15,8 @@ from datetime import datetime
 # --- SAFE IMPORTS ---
 try:
     from google.cloud import language_v1
+    # NEW: Import Google Vision
+    from google.cloud import vision
     NLP_AVAILABLE = True
 except ImportError:
     NLP_AVAILABLE = False
@@ -25,7 +27,6 @@ try:
 except ImportError:
     TEXTRAZOR_AVAILABLE = False
 
-# Try to import cloudscraper for anti-bot bypass
 try:
     import cloudscraper
     SCRAPER_AVAILABLE = True
@@ -45,7 +46,7 @@ def setup_google_auth():
                 except json.JSONDecodeError: return False
             
             creds_dict = dict(creds)
-            # CRITICAL FIX: Normalize newlines in private_key
+            # Fix newlines in private key
             if "private_key" in creds_dict:
                 creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
 
@@ -80,7 +81,7 @@ def get_db_collection():
         except KeyError: return None
     return None
 
-# --- CRAWLER LOGIC ---
+# --- UTILS ---
 def get_page_hash(content):
     return hashlib.md5(content.encode('utf-8')).hexdigest()
 
@@ -91,21 +92,38 @@ def normalize_url(url):
         return clean.rstrip('/')
     except: return url
 
+# --- IMAGE OCR FUNCTION (NEW) ---
+def detect_text_in_image(image_url):
+    """
+    Downloads image and sends to Google Vision API to extract text.
+    """
+    if not NLP_AVAILABLE: return None
+    
+    try:
+        client = vision.ImageAnnotatorClient()
+        image = vision.Image()
+        image.source.image_uri = image_url
+        
+        # Call Google Vision API
+        response = client.text_detection(image=image)
+        texts = response.text_annotations
+        
+        if texts:
+            # texts[0] contains the full text block found in the image
+            return texts[0].description.strip()
+        return None
+    except Exception as e:
+        # e.g., Image not accessible, format not supported
+        return None 
+
+# --- CRAWLER LOGIC ---
 def crawl_site(start_url):
-    """
-    Crawls up to 1000 pages. 
-    automatically clears the database before starting.
-    """
     collection = get_db_collection()
     if collection is None:
         st.error("Database unavailable.")
         return
     
-    # 1. AUTO-WIPE DATABASE
     collection.delete_many({})
-    
-    # 2. SETUP CRAWL
-    max_pages = 1000
     start_url = normalize_url(start_url)
     base_domain = urlparse(start_url).netloc.replace('www.', '')
     
@@ -118,13 +136,13 @@ def crawl_site(start_url):
     
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
     
-    while queue and count < max_pages:
+    while queue and count < 1000:
         url = queue.pop(0)
         if url in visited: continue
         visited.add(url)
         count += 1
-        progress_bar.progress(count / max_pages)
-        status_text.text(f"Crawling {count}/{max_pages}: {url}")
+        progress_bar.progress(count / 1000)
+        status_text.text(f"Crawling {count}: {url}")
         
         try:
             time.sleep(0.1)
@@ -155,9 +173,27 @@ def crawl_site(start_url):
                 page_data['content_hash'] = get_page_hash(text_content)
                 page_data['word_count'] = len(text_content.split())
                 
-                for img in soup.find_all('img'):
-                    if img.get('src'):
-                        page_data['images'].append({'src': urljoin(url, img.get('src')), 'alt': img.get('alt', '')})
+                # --- PROCESS IMAGES (With OCR) ---
+                imgs_found = soup.find_all('img')
+                # Limit OCR to first 5 images per page to save API costs/time
+                for i, img in enumerate(imgs_found):
+                    src = img.get('src')
+                    if src:
+                        abs_src = urljoin(url, src)
+                        img_data = {
+                            'src': abs_src,
+                            'alt': img.get('alt', ''),
+                            'ocr_text': None # Default empty
+                        }
+                        
+                        # Only run OCR on first 5 images
+                        if i < 5:
+                            # Note: This increases crawl time significantly
+                            detected_text = detect_text_in_image(abs_src)
+                            if detected_text:
+                                img_data['ocr_text'] = detected_text
+                                
+                        page_data['images'].append(img_data)
                 
                 robots = soup.find('meta', attrs={'name': 'robots'})
                 if robots and 'noindex' in robots.get('content', '').lower(): page_data['indexable'] = False
@@ -219,4 +255,36 @@ def analyze_textrazor(text, auth_status):
         if not text or len(text.strip()) < 50: return None, "Text too short for TextRazor."
         response = client.analyze(text)
         return response, None
+    except Exception as e: return None, str(e)
+
+# --- SCRAPER (ROBUST) ---
+def scrape_external_page(url):
+    if SCRAPER_AVAILABLE:
+        try:
+            scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False})
+            resp = scraper.get(url, timeout=20)
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, 'html.parser')
+                for s in soup(["script", "style", "nav", "footer", "iframe", "noscript"]): s.extract()
+                return soup.get_text(separator=' ', strip=True), None
+        except Exception: pass
+
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
+        }
+        
+        session = requests.Session()
+        resp = session.get(url, headers=headers, timeout=15, verify=False)
+        
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            for s in soup(["script", "style", "nav", "footer", "iframe", "noscript"]): s.extract()
+            return soup.get_text(separator=' ', strip=True), None
+            
+        return None, f"Failed to fetch: Status {resp.status_code}"
     except Exception as e: return None, str(e)
