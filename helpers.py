@@ -11,7 +11,66 @@ import os
 import json
 import urllib3
 from datetime import datetime
+# Add this import at the top of helpers.py
+try:
+    import cloudscraper
+    SCRAPER_AVAILABLE = True
+except ImportError:
+    SCRAPER_AVAILABLE = False
 
+# ... keep your other imports ...
+
+# --- ROBUST SCRAPER (Fixed for Status 247/403) ---
+def scrape_external_page(url):
+    if not SCRAPER_AVAILABLE:
+        return None, "cloudscraper library missing. Install it via pip."
+        
+    try:
+        # Create a CloudScraper instance
+        # 'browser' param tells it to mimic a specific Chrome version
+        scraper = cloudscraper.create_scraper(
+            browser={
+                'browser': 'chrome',
+                'platform': 'windows',
+                'mobile': False
+            }
+        )
+        
+        # Make the request
+        resp = scraper.get(url, timeout=20)
+        
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            
+            # Clean up the soup
+            for s in soup(["script", "style", "nav", "footer", "iframe", "noscript"]): 
+                s.extract()
+                
+            text = soup.get_text(separator=' ', strip=True)
+            
+            # Basic check to see if we got actual content or a "Access Denied" page
+            if "Access Denied" in text[:50] or "Security Challenge" in text[:50]:
+                return None, "Blocked by Anti-Bot (Captcha Challenge)"
+                
+            return text, None
+        
+        return None, f"Failed to fetch: Status {resp.status_code}"
+        
+    except Exception as e:
+        # Fallback to standard requests if cloudscraper fails (rare)
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
+            resp = requests.get(url, headers=headers, timeout=10, verify=False)
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, 'html.parser')
+                for s in soup(["script", "style"]): s.extract()
+                return soup.get_text(separator=' ', strip=True), None
+        except:
+            pass
+            
+        return None, f"Scraping Error: {str(e)}"
 # --- SAFE IMPORTS ---
 try:
     from google.cloud import language_v1
