@@ -5,7 +5,6 @@ from helpers import (
     get_db_collection, crawl_site, get_metrics_df, analyze_google, 
     analyze_textrazor, scrape_external_page, NLP_AVAILABLE, TEXTRAZOR_AVAILABLE
 )
-# Note: Since helpers.py is in the same folder, simple import works best.
 
 # --- CONFIG ---
 st.set_page_config(page_title="SeoSpider Pro", page_icon="🕸️", layout="wide")
@@ -145,7 +144,7 @@ with tab1:
 # TAB 2: GOOGLE NLP
 with tab2:
     if df is not None and google_auth_status and NLP_AVAILABLE:
-        from google.cloud import language_v1 # Import here for Type hinting
+        from google.cloud import language_v1 
         url_sel = st.selectbox("Select Page for G-NLP:", df['url'].unique(), key="gnlp_sel")
         if st.button("Analyze with Google"):
             doc = get_db_collection().find_one({"url": url_sel})
@@ -235,4 +234,5 @@ with tab4:
                         with c3:
                             st.info(f"Unique ({len(unique)})")
                             st.dataframe(pd.DataFrame(unique, columns=["Entity"]), height=400, use_container_width=True)
-                        else: st.error(f"Analysis Failed.")
+                    else: st.error(f"Analysis Failed.")
+                else: st.error("Failed to fetch page text.")
