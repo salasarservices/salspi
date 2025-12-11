@@ -13,3 +13,4 @@ lxml
 matplotlib
 urllib3
 textrazor
+cloudscraper
