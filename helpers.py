@@ -25,6 +25,7 @@ try:
 except ImportError:
     TEXTRAZOR_AVAILABLE = False
 
+# Try to import cloudscraper for anti-bot bypass
 try:
     import cloudscraper
     SCRAPER_AVAILABLE = True
@@ -34,41 +35,26 @@ except ImportError:
 # Suppress SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# --- AUTHENTICATION (FIXED) ---
+# --- AUTHENTICATION ---
 def setup_google_auth():
-    """
-    Sets up Google Auth by creating a temporary JSON file from Streamlit secrets.
-    CRITICAL FIX: Normalizes newlines in the private_key.
-    """
     if "google" in st.secrets and "credentials" in st.secrets["google"]:
         try:
             creds = st.secrets["google"]["credentials"]
-            
-            # 1. Handle if secrets are returned as a string (rare but possible)
             if isinstance(creds, str):
                 try: creds = json.loads(creds)
                 except json.JSONDecodeError: return False
             
-            # 2. Convert AttrDict to standard Dict
             creds_dict = dict(creds)
-            
-            # 3. CRITICAL FIX: Fix the Private Key Newlines
-            # Streamlit TOML sometimes interprets \n as a literal backslash-n string.
-            # We replace literal "\\n" with actual newlines "\n" so json.dump escapes them correctly.
+            # CRITICAL FIX: Normalize newlines in private_key
             if "private_key" in creds_dict:
-                pk = creds_dict["private_key"]
-                creds_dict["private_key"] = pk.replace("\\n", "\n")
+                creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
 
-            # 4. Dump to file
             with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8') as f:
                 json.dump(creds_dict, f)
                 temp_cred_path = f.name
-            
             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_cred_path
             return True
-        except Exception as e:
-            # st.error(f"Auth Error: {e}") # Uncomment for debugging
-            return False
+        except Exception: return False
     return False
 
 def setup_textrazor_auth():
@@ -105,13 +91,21 @@ def normalize_url(url):
         return clean.rstrip('/')
     except: return url
 
-def crawl_site(start_url, max_pages):
+def crawl_site(start_url):
+    """
+    Crawls up to 1000 pages. 
+    automatically clears the database before starting.
+    """
     collection = get_db_collection()
     if collection is None:
         st.error("Database unavailable.")
         return
     
+    # 1. AUTO-WIPE DATABASE
     collection.delete_many({})
+    
+    # 2. SETUP CRAWL
+    max_pages = 1000
     start_url = normalize_url(start_url)
     base_domain = urlparse(start_url).netloc.replace('www.', '')
     
@@ -205,7 +199,7 @@ def get_metrics_df():
     
     return df
 
-# --- NLP & SCRAPER ---
+# --- NLP ENGINE ---
 def analyze_google(text):
     if not NLP_AVAILABLE: return None, "Library missing."
     try:
@@ -225,46 +219,4 @@ def analyze_textrazor(text, auth_status):
         if not text or len(text.strip()) < 50: return None, "Text too short for TextRazor."
         response = client.analyze(text)
         return response, None
-    except Exception as e: return None, str(e)
-
-# --- ROBUST SCRAPER (BYPASSES STATUS 247/403) ---
-def scrape_external_page(url):
-    # 1. Try CloudScraper (Primary method for Anti-Bot)
-    if SCRAPER_AVAILABLE:
-        try:
-            # Create a scraper that mimics a desktop Chrome browser
-            scraper = cloudscraper.create_scraper(
-                browser={
-                    'browser': 'chrome',
-                    'platform': 'windows',
-                    'mobile': False
-                }
-            )
-            resp = scraper.get(url, timeout=20)
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                for s in soup(["script", "style", "nav", "footer", "iframe", "noscript"]): s.extract()
-                return soup.get_text(separator=' ', strip=True), None
-        except Exception:
-            pass # Fallback to standard requests if cloudscraper errors out
-
-    # 2. Fallback: Requests with Full Browser Headers
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
-        }
-        
-        session = requests.Session()
-        resp = session.get(url, headers=headers, timeout=15, verify=False)
-        
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            for s in soup(["script", "style", "nav", "footer", "iframe", "noscript"]): s.extract()
-            return soup.get_text(separator=' ', strip=True), None
-            
-        return None, f"Failed to fetch: Status {resp.status_code}"
     except Exception as e: return None, str(e)
