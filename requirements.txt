@@ -12,3 +12,4 @@ dnspython
 lxml
 matplotlib
 urllib3
+textrazor
