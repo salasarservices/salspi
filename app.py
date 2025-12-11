@@ -3,7 +3,7 @@ import pandas as pd
 from helpers import (
     setup_google_auth, setup_textrazor_auth, init_mongo_connection, 
     get_db_collection, crawl_site, get_metrics_df, analyze_google, 
-    analyze_textrazor, scrape_external_page, NLP_AVAILABLE, TEXTRAZOR_AVAILABLE
+    analyze_textrazor, NLP_AVAILABLE, TEXTRAZOR_AVAILABLE
 )
 
 # --- CONFIG ---
@@ -47,13 +47,13 @@ with st.sidebar:
     else: st.warning("TextRazor: Inactive")
 
     st.markdown("---")
+    # Simplified Control Panel
     target_url = st.text_input("Target URL", "https://example.com")
-    max_pages = st.number_input("Max Pages", 10, 500, 50)
+    st.caption("Default Crawl Limit: 1000 Pages")
+    
     if st.button("Start Crawl", type="primary"):
-        crawl_site(target_url, max_pages)
-        st.rerun()
-    if st.button("Clear DB"):
-        get_db_collection().delete_many({})
+        # Crawl now auto-clears DB and handles 1000 page limit
+        crawl_site(target_url)
         st.rerun()
 
 # --- HELPER UI ---
@@ -68,10 +68,8 @@ def display_metric_block(title, count, df_data, color_hex, display_cols):
         with st.expander(f"Show Top 10 {title}"):
             if isinstance(df_data, pd.DataFrame):
                 valid_cols = [c for c in display_cols if c in df_data.columns]
-                # FIXED: Replaced use_container_width with width="stretch"
                 st.dataframe(df_data[valid_cols].head(10), width="stretch")
             elif isinstance(df_data, list):
-                # FIXED: Replaced use_container_width with width="stretch"
                 st.dataframe(pd.DataFrame(df_data).head(10), width="stretch")
 
 # --- MAIN UI ---
@@ -145,6 +143,7 @@ with tab1:
 
 # TAB 2: GOOGLE NLP
 with tab2:
+    st.subheader("Google NLP Analysis")
     if df is not None and google_auth_status and NLP_AVAILABLE:
         from google.cloud import language_v1 
         url_sel = st.selectbox("Select Page for G-NLP:", df['url'].unique(), key="gnlp_sel")
@@ -157,50 +156,23 @@ with tab2:
                 c1.metric("Sentiment", f"{s.score:.2f}")
                 c2.metric("Magnitude", f"{s.magnitude:.2f}")
                 ents = [{"Name": e.name, "Type": language_v1.Entity.Type(e.type_).name, "Salience": f"{e.salience:.1%}"} for e in res['entities'][:10]]
-                # FIXED: Replaced use_container_width with width="stretch"
                 st.dataframe(pd.DataFrame(ents), width="stretch")
             else: st.error(err)
-        
-        st.markdown("---")
-        comp_url_g = st.text_input("Competitor URL (Google):")
-        if st.button("Compare (Google)"):
-            doc = get_db_collection().find_one({"url": url_sel})
-            comp_txt, c_err = scrape_external_page(comp_url_g)
-            
-            # FIXED: Added Error Handling for silent failures
-            if doc and comp_txt:
-                res_in, _ = analyze_google(doc.get('page_text', ''))
-                res_ex, _ = analyze_google(comp_txt)
-                if res_in and res_ex:
-                    c1, c2 = st.columns(2)
-                    with c1: 
-                        st.subheader("Our Page")
-                        st.metric("Sentiment", f"{res_in['sentiment'].score:.2f}")
-                        # FIXED: Replaced use_container_width with width="stretch"
-                        st.dataframe(pd.DataFrame([{"Name": e.name, "Sal": f"{e.salience:.1%}"} for e in res_in['entities'][:5]]), width="stretch")
-                    with c2:
-                        st.subheader("Competitor")
-                        st.metric("Sentiment", f"{res_ex['sentiment'].score:.2f}")
-                        # FIXED: Replaced use_container_width with width="stretch"
-                        st.dataframe(pd.DataFrame([{"Name": e.name, "Sal": f"{e.salience:.1%}"} for e in res_ex['entities'][:5]]), width="stretch")
-            elif not doc:
-                st.error("Internal page not found in Database.")
-            else:
-                st.error(f"Failed to scrape competitor: {c_err}")
+    elif not google_auth_status:
+        st.warning("Google NLP is not active. Check credentials.")
 
 # TAB 3: SEARCH
 with tab3:
     q = st.text_input("Deep Search:")
-    # FIX: Added 'is not None' for PyMongo 4.0 safety
     if q and get_db_collection() is not None:
         res = list(get_db_collection().find({"page_text": {"$regex": q, "$options": "i"}}).limit(20))
         if res:
             data = [{"URL": r['url'], "Match": "..." + r['page_text'][r['page_text'].lower().find(q.lower()):][:100] + "..."} for r in res]
-            # FIXED: Replaced use_container_width with width="stretch"
             st.dataframe(pd.DataFrame(data), width="stretch")
 
 # TAB 4: TEXTRAZOR
 with tab4:
+    st.subheader("TextRazor Content Intelligence")
     if not TEXTRAZOR_AVAILABLE: st.error("Please install TextRazor.")
     elif not textrazor_auth_status: st.error("Please add TextRazor API key.")
     elif df is not None:
@@ -214,45 +186,9 @@ with tab4:
                     with c1:
                         st.markdown("#### Top Entities")
                         ents = [{"ID": e.id, "Relevance": f"{e.relevance_score:.2f}"} for e in sorted(resp.entities(), key=lambda x: x.relevance_score, reverse=True)[:10]]
-                        # FIXED: Replaced use_container_width with width="stretch"
                         st.dataframe(pd.DataFrame(ents), width="stretch")
                     with c2:
                         st.markdown("#### Top Topics")
                         tops = [{"Label": t.label, "Score": f"{t.score:.2f}"} for t in sorted(resp.topics(), key=lambda x: x.score, reverse=True)[:10]]
-                        # FIXED: Replaced use_container_width with width="stretch"
                         st.dataframe(pd.DataFrame(tops), width="stretch")
                 else: st.error(err)
-
-        st.markdown("---")
-        comp_url_tr = st.text_input("Enter Competitor URL:", key="tr_comp_input")
-        if st.button("Compare Pages (TextRazor)"):
-            doc = get_db_collection().find_one({"url": tr_url_sel})
-            with st.spinner("Analyzing..."):
-                text_a = doc.get('page_text', '')
-                text_b, err_b = scrape_external_page(comp_url_tr)
-                
-                # FIXED: Added Error Handling logic
-                if text_a and text_b:
-                    resp_a, _ = analyze_textrazor(text_a, textrazor_auth_status)
-                    resp_b, _ = analyze_textrazor(text_b, textrazor_auth_status)
-                    if resp_a and resp_b:
-                        ents_a = {e.id for e in resp_a.entities()}
-                        ents_b = {e.id for e in resp_b.entities()}
-                        common = list(ents_a.intersection(ents_b))
-                        missing = list(ents_b - ents_a) 
-                        unique = list(ents_a - ents_b)
-                        c1, c2, c3 = st.columns(3)
-                        with c1:
-                            st.success(f"Common ({len(common)})")
-                            # FIXED: Replaced use_container_width with width="stretch"
-                            st.dataframe(pd.DataFrame(common, columns=["Entity"]), height=400, width="stretch")
-                        with c2:
-                            st.error(f"Missing ({len(missing)})")
-                            # FIXED: Replaced use_container_width with width="stretch"
-                            st.dataframe(pd.DataFrame(missing, columns=["Entity"]), height=400, width="stretch")
-                        with c3:
-                            st.info(f"Unique ({len(unique)})")
-                            # FIXED: Replaced use_container_width with width="stretch"
-                            st.dataframe(pd.DataFrame(unique, columns=["Entity"]), height=400, width="stretch")
-                    else: st.error(f"Analysis Failed.")
-                else: st.error(f"Failed to fetch pages. {err_b if err_b else ''}")
