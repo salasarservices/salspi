@@ -68,9 +68,11 @@ def display_metric_block(title, count, df_data, color_hex, display_cols):
         with st.expander(f"Show Top 10 {title}"):
             if isinstance(df_data, pd.DataFrame):
                 valid_cols = [c for c in display_cols if c in df_data.columns]
-                st.dataframe(df_data[valid_cols].head(10), use_container_width=True)
+                # FIXED: Replaced use_container_width with width="stretch"
+                st.dataframe(df_data[valid_cols].head(10), width="stretch")
             elif isinstance(df_data, list):
-                st.dataframe(pd.DataFrame(df_data).head(10), use_container_width=True)
+                # FIXED: Replaced use_container_width with width="stretch"
+                st.dataframe(pd.DataFrame(df_data).head(10), width="stretch")
 
 # --- MAIN UI ---
 tab1, tab2, tab3, tab4 = st.tabs(["📊 SEO Report", "🧠 NLP Analysis", "🔍 Search", "📄 Content Analysis"])
@@ -155,7 +157,8 @@ with tab2:
                 c1.metric("Sentiment", f"{s.score:.2f}")
                 c2.metric("Magnitude", f"{s.magnitude:.2f}")
                 ents = [{"Name": e.name, "Type": language_v1.Entity.Type(e.type_).name, "Salience": f"{e.salience:.1%}"} for e in res['entities'][:10]]
-                st.dataframe(pd.DataFrame(ents), use_container_width=True)
+                # FIXED: Replaced use_container_width with width="stretch"
+                st.dataframe(pd.DataFrame(ents), width="stretch")
             else: st.error(err)
         
         st.markdown("---")
@@ -163,6 +166,8 @@ with tab2:
         if st.button("Compare (Google)"):
             doc = get_db_collection().find_one({"url": url_sel})
             comp_txt, c_err = scrape_external_page(comp_url_g)
+            
+            # FIXED: Added Error Handling for silent failures
             if doc and comp_txt:
                 res_in, _ = analyze_google(doc.get('page_text', ''))
                 res_ex, _ = analyze_google(comp_txt)
@@ -171,20 +176,28 @@ with tab2:
                     with c1: 
                         st.subheader("Our Page")
                         st.metric("Sentiment", f"{res_in['sentiment'].score:.2f}")
-                        st.dataframe(pd.DataFrame([{"Name": e.name, "Sal": f"{e.salience:.1%}"} for e in res_in['entities'][:5]]), use_container_width=True)
+                        # FIXED: Replaced use_container_width with width="stretch"
+                        st.dataframe(pd.DataFrame([{"Name": e.name, "Sal": f"{e.salience:.1%}"} for e in res_in['entities'][:5]]), width="stretch")
                     with c2:
                         st.subheader("Competitor")
                         st.metric("Sentiment", f"{res_ex['sentiment'].score:.2f}")
-                        st.dataframe(pd.DataFrame([{"Name": e.name, "Sal": f"{e.salience:.1%}"} for e in res_ex['entities'][:5]]), use_container_width=True)
+                        # FIXED: Replaced use_container_width with width="stretch"
+                        st.dataframe(pd.DataFrame([{"Name": e.name, "Sal": f"{e.salience:.1%}"} for e in res_ex['entities'][:5]]), width="stretch")
+            elif not doc:
+                st.error("Internal page not found in Database.")
+            else:
+                st.error(f"Failed to scrape competitor: {c_err}")
 
 # TAB 3: SEARCH
 with tab3:
     q = st.text_input("Deep Search:")
+    # FIX: Added 'is not None' for PyMongo 4.0 safety
     if q and get_db_collection() is not None:
         res = list(get_db_collection().find({"page_text": {"$regex": q, "$options": "i"}}).limit(20))
         if res:
             data = [{"URL": r['url'], "Match": "..." + r['page_text'][r['page_text'].lower().find(q.lower()):][:100] + "..."} for r in res]
-            st.dataframe(pd.DataFrame(data), use_container_width=True)
+            # FIXED: Replaced use_container_width with width="stretch"
+            st.dataframe(pd.DataFrame(data), width="stretch")
 
 # TAB 4: TEXTRAZOR
 with tab4:
@@ -201,11 +214,13 @@ with tab4:
                     with c1:
                         st.markdown("#### Top Entities")
                         ents = [{"ID": e.id, "Relevance": f"{e.relevance_score:.2f}"} for e in sorted(resp.entities(), key=lambda x: x.relevance_score, reverse=True)[:10]]
-                        st.dataframe(pd.DataFrame(ents), use_container_width=True)
+                        # FIXED: Replaced use_container_width with width="stretch"
+                        st.dataframe(pd.DataFrame(ents), width="stretch")
                     with c2:
                         st.markdown("#### Top Topics")
                         tops = [{"Label": t.label, "Score": f"{t.score:.2f}"} for t in sorted(resp.topics(), key=lambda x: x.score, reverse=True)[:10]]
-                        st.dataframe(pd.DataFrame(tops), use_container_width=True)
+                        # FIXED: Replaced use_container_width with width="stretch"
+                        st.dataframe(pd.DataFrame(tops), width="stretch")
                 else: st.error(err)
 
         st.markdown("---")
@@ -215,6 +230,8 @@ with tab4:
             with st.spinner("Analyzing..."):
                 text_a = doc.get('page_text', '')
                 text_b, err_b = scrape_external_page(comp_url_tr)
+                
+                # FIXED: Added Error Handling logic
                 if text_a and text_b:
                     resp_a, _ = analyze_textrazor(text_a, textrazor_auth_status)
                     resp_b, _ = analyze_textrazor(text_b, textrazor_auth_status)
@@ -227,12 +244,15 @@ with tab4:
                         c1, c2, c3 = st.columns(3)
                         with c1:
                             st.success(f"Common ({len(common)})")
-                            st.dataframe(pd.DataFrame(common, columns=["Entity"]), height=400, use_container_width=True)
+                            # FIXED: Replaced use_container_width with width="stretch"
+                            st.dataframe(pd.DataFrame(common, columns=["Entity"]), height=400, width="stretch")
                         with c2:
                             st.error(f"Missing ({len(missing)})")
-                            st.dataframe(pd.DataFrame(missing, columns=["Entity"]), height=400, use_container_width=True)
+                            # FIXED: Replaced use_container_width with width="stretch"
+                            st.dataframe(pd.DataFrame(missing, columns=["Entity"]), height=400, width="stretch")
                         with c3:
                             st.info(f"Unique ({len(unique)})")
-                            st.dataframe(pd.DataFrame(unique, columns=["Entity"]), height=400, use_container_width=True)
+                            # FIXED: Replaced use_container_width with width="stretch"
+                            st.dataframe(pd.DataFrame(unique, columns=["Entity"]), height=400, width="stretch")
                     else: st.error(f"Analysis Failed.")
-                else: st.error("Failed to fetch page text.")
+                else: st.error(f"Failed to fetch pages. {err_b if err_b else ''}")
