@@ -25,7 +25,6 @@ try:
 except ImportError:
     TEXTRAZOR_AVAILABLE = False
 
-# Try to import cloudscraper for anti-bot bypass
 try:
     import cloudscraper
     SCRAPER_AVAILABLE = True
@@ -35,22 +34,41 @@ except ImportError:
 # Suppress SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# --- AUTHENTICATION ---
+# --- AUTHENTICATION (FIXED) ---
 def setup_google_auth():
+    """
+    Sets up Google Auth by creating a temporary JSON file from Streamlit secrets.
+    CRITICAL FIX: Normalizes newlines in the private_key.
+    """
     if "google" in st.secrets and "credentials" in st.secrets["google"]:
         try:
             creds = st.secrets["google"]["credentials"]
+            
+            # 1. Handle if secrets are returned as a string (rare but possible)
             if isinstance(creds, str):
                 try: creds = json.loads(creds)
                 except json.JSONDecodeError: return False
             
+            # 2. Convert AttrDict to standard Dict
             creds_dict = dict(creds)
+            
+            # 3. CRITICAL FIX: Fix the Private Key Newlines
+            # Streamlit TOML sometimes interprets \n as a literal backslash-n string.
+            # We replace literal "\\n" with actual newlines "\n" so json.dump escapes them correctly.
+            if "private_key" in creds_dict:
+                pk = creds_dict["private_key"]
+                creds_dict["private_key"] = pk.replace("\\n", "\n")
+
+            # 4. Dump to file
             with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8') as f:
                 json.dump(creds_dict, f)
                 temp_cred_path = f.name
+            
             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_cred_path
             return True
-        except Exception: return False
+        except Exception as e:
+            # st.error(f"Auth Error: {e}") # Uncomment for debugging
+            return False
     return False
 
 def setup_textrazor_auth():
@@ -104,7 +122,6 @@ def crawl_site(start_url, max_pages):
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    # Standard headers for internal crawler
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
     
     while queue and count < max_pages:
@@ -210,34 +227,35 @@ def analyze_textrazor(text, auth_status):
         return response, None
     except Exception as e: return None, str(e)
 
-# --- ROBUST SCRAPER (FIXED FOR STATUS 247) ---
+# --- ROBUST SCRAPER (BYPASSES STATUS 247/403) ---
 def scrape_external_page(url):
-    # 1. Try CloudScraper (Best for Cloudflare/WAF)
+    # 1. Try CloudScraper (Primary method for Anti-Bot)
     if SCRAPER_AVAILABLE:
         try:
-            scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False})
+            # Create a scraper that mimics a desktop Chrome browser
+            scraper = cloudscraper.create_scraper(
+                browser={
+                    'browser': 'chrome',
+                    'platform': 'windows',
+                    'mobile': False
+                }
+            )
             resp = scraper.get(url, timeout=20)
             if resp.status_code == 200:
                 soup = BeautifulSoup(resp.text, 'html.parser')
                 for s in soup(["script", "style", "nav", "footer", "iframe", "noscript"]): s.extract()
                 return soup.get_text(separator=' ', strip=True), None
         except Exception:
-            pass # Fallback to requests if cloudscraper fails
+            pass # Fallback to standard requests if cloudscraper errors out
 
-    # 2. Fallback: Requests with Real Browser Headers
+    # 2. Fallback: Requests with Full Browser Headers
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'Cache-Control': 'max-age=0'
+            'Upgrade-Insecure-Requests': '1'
         }
         
         session = requests.Session()
