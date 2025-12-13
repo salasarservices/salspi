@@ -33,7 +33,7 @@ except ImportError:
     SCRAPER_AVAILABLE = False
 
 try:
-    # FIX: Correct import for the pyseoanalyzer package
+    # NOTE: The package is 'pyseoanalyzer' but the import is 'seoanalyzer'
     from seoanalyzer import analyze as run_seo_audit
     SEO_LIB_AVAILABLE = True
 except ImportError:
@@ -125,16 +125,12 @@ def fetch_bing_backlinks(site_url, api_key):
         else: return None, f"Bing Error: {response.status_code}"
     except Exception as e: return None, str(e)
 
-# --- TECHNICAL AUDIT (WRAPPER) ---
+# --- TECHNICAL AUDIT ---
 def run_technical_audit(site_url):
-    """
-    Wrapper for pyseoanalyzer.
-    """
     if not SEO_LIB_AVAILABLE:
-        return None, "pyseoanalyzer library missing. Please add 'pyseoanalyzer' to requirements.txt"
+        return None, "pyseoanalyzer library missing. Please add 'pyseoanalyzer' to requirements.txt and Reboot."
     
     try:
-        # Running the audit
         output = run_seo_audit(site_url)
         return output, None
     except Exception as e:
