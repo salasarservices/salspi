@@ -89,7 +89,6 @@ def display_metric_block(title, count, df_data, color_hex, display_cols):
             )
 
 # --- MAIN UI ---
-# Added Tab 6: Deep Tech Audit
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📊 SEO Report", 
     "🧠 NLP Analysis", 
