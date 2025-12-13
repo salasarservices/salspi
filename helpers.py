@@ -15,7 +15,6 @@ from datetime import datetime
 # --- SAFE IMPORTS ---
 try:
     from google.cloud import language_v1
-    # NEW: Import Google Vision
     from google.cloud import vision
     NLP_AVAILABLE = True
 except ImportError:
@@ -33,6 +32,12 @@ try:
 except ImportError:
     SCRAPER_AVAILABLE = False
 
+try:
+    from seoanalyzer import analyze as run_seo_audit
+    SEO_LIB_AVAILABLE = True
+except ImportError:
+    SEO_LIB_AVAILABLE = False
+
 # Suppress SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -46,7 +51,6 @@ def setup_google_auth():
                 except json.JSONDecodeError: return False
             
             creds_dict = dict(creds)
-            # Fix newlines in private key
             if "private_key" in creds_dict:
                 creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
 
@@ -92,29 +96,49 @@ def normalize_url(url):
         return clean.rstrip('/')
     except: return url
 
-# --- IMAGE OCR FUNCTION (NEW) ---
+# --- IMAGE OCR ---
 def detect_text_in_image(image_url):
-    """
-    Downloads image and sends to Google Vision API to extract text.
-    """
     if not NLP_AVAILABLE: return None
-    
     try:
         client = vision.ImageAnnotatorClient()
         image = vision.Image()
         image.source.image_uri = image_url
-        
-        # Call Google Vision API
         response = client.text_detection(image=image)
         texts = response.text_annotations
-        
-        if texts:
-            # texts[0] contains the full text block found in the image
-            return texts[0].description.strip()
+        if texts: return texts[0].description.strip()
         return None
+    except Exception: return None 
+
+# --- BACKLINK FUNCTIONS ---
+def fetch_bing_backlinks(site_url, api_key):
+    if not api_key: return None, "Bing API Key missing."
+    endpoint = "https://ssl.bing.com/webmaster/api.svc/json/GetInboundLinks"
+    params = {'siteUrl': site_url, 'apikey': api_key}
+    try:
+        response = requests.get(endpoint, params=params, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            if 'd' in data: return data['d'], None
+            return data, None
+        elif response.status_code == 401: return None, "Invalid Bing API Key."
+        else: return None, f"Bing Error: {response.status_code}"
+    except Exception as e: return None, str(e)
+
+# --- NEW: PYTHON SEO ANALYZER ---
+def run_technical_audit(site_url):
+    """
+    Runs sethblack/python-seo-analyzer.
+    Returns a dict with 'pages', 'keywords', 'errors', 'warnings'.
+    """
+    if not SEO_LIB_AVAILABLE:
+        return None, "seo-analyzer library missing."
+    
+    try:
+        # The library crawls the site automatically
+        output = run_seo_audit(site_url)
+        return output, None
     except Exception as e:
-        # e.g., Image not accessible, format not supported
-        return None 
+        return None, f"Audit Failed: {str(e)}"
 
 # --- CRAWLER LOGIC ---
 def crawl_site(start_url):
@@ -133,7 +157,6 @@ def crawl_site(start_url):
     
     progress_bar = st.progress(0)
     status_text = st.empty()
-    
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
     
     while queue and count < 1000:
@@ -173,26 +196,15 @@ def crawl_site(start_url):
                 page_data['content_hash'] = get_page_hash(text_content)
                 page_data['word_count'] = len(text_content.split())
                 
-                # --- PROCESS IMAGES (With OCR) ---
                 imgs_found = soup.find_all('img')
-                # Limit OCR to first 5 images per page to save API costs/time
                 for i, img in enumerate(imgs_found):
                     src = img.get('src')
                     if src:
                         abs_src = urljoin(url, src)
-                        img_data = {
-                            'src': abs_src,
-                            'alt': img.get('alt', ''),
-                            'ocr_text': None # Default empty
-                        }
-                        
-                        # Only run OCR on first 5 images
+                        img_data = {'src': abs_src, 'alt': img.get('alt', ''), 'ocr_text': None}
                         if i < 5:
-                            # Note: This increases crawl time significantly
                             detected_text = detect_text_in_image(abs_src)
-                            if detected_text:
-                                img_data['ocr_text'] = detected_text
-                                
+                            if detected_text: img_data['ocr_text'] = detected_text
                         page_data['images'].append(img_data)
                 
                 robots = soup.find('meta', attrs={'name': 'robots'})
@@ -235,7 +247,7 @@ def get_metrics_df():
     
     return df
 
-# --- NLP ENGINE ---
+# --- NLP & SCRAPER ---
 def analyze_google(text):
     if not NLP_AVAILABLE: return None, "Library missing."
     try:
@@ -257,7 +269,6 @@ def analyze_textrazor(text, auth_status):
         return response, None
     except Exception as e: return None, str(e)
 
-# --- SCRAPER (ROBUST) ---
 def scrape_external_page(url):
     if SCRAPER_AVAILABLE:
         try:
