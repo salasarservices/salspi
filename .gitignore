@@ -1,8 +1,26 @@
+# --- Python & Environment ---
 venv/
 __pycache__/
 *.pyc
+
+# --- Environment Variables (Critical) ---
 .env
+
+# --- Streamlit Secrets (CRITICAL) ---
+.streamlit/secrets.toml
+# You can leave .streamlit/config.toml if you want, but ignore secrets!
+
+# --- Google Cloud Keys ---
+# Prevents accidental upload of any JSON key files you might drop in the folder
+*.json
+
+# --- Databases ---
 *.db
 *.sqlite
-node_modules/
+
+# --- Generated Reports/Folders ---
 html_reports/
+node_modules/
+
+# --- OS Junk Files ---
+.DS_Store
