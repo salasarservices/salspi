@@ -1,301 +1,318 @@
 import streamlit as st
 import pandas as pd
-import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
-import pymongo
-import tempfile
-import time
-import hashlib
-import os
-import json
-import urllib3
-from datetime import datetime
+from helpers import (
+    setup_google_auth, setup_textrazor_auth, init_mongo_connection, 
+    get_db_collection, crawl_site, get_metrics_df, analyze_google, 
+    analyze_textrazor, scrape_external_page, fetch_bing_backlinks,
+    run_technical_audit, # New Import
+    NLP_AVAILABLE, TEXTRAZOR_AVAILABLE
+)
 
-# --- SAFE IMPORTS ---
-try:
-    from google.cloud import language_v1
-    from google.cloud import vision
-    NLP_AVAILABLE = True
-except ImportError:
-    NLP_AVAILABLE = False
+# --- CONFIG ---
+st.set_page_config(page_title="SeoSpider Pro", page_icon="🕸️", layout="wide")
+st.markdown("""
+<style>
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+    .stTabs [data-baseweb="tab"] {
+        background-color: #ffffff; border-radius: 4px; padding: 10px 20px; border: 1px solid #f0f0f0;
+    }
+    .stTabs [aria-selected="true"] {
+        background-color: #E3F2FD !important; color: #000000 !important; border-color: #90CDF4 !important;
+    }
+    .metric-card {
+        padding: 20px; border-radius: 12px; margin-bottom: 10px;
+        border: 1px solid rgba(0,0,0,0.05); color: #333;
+    }
+    .metric-title { font-size: 1.1rem; font-weight: 600; margin-bottom: 5px; opacity: 0.8; }
+    .metric-value { font-size: 2.5rem; font-weight: 800; margin-bottom: 0; }
+    .metric-desc { font-size: 0.9rem; opacity: 0.7; margin-bottom: 10px; }
+    div[data-testid="stDataFrame"] { width: 100%; }
+</style>
+""", unsafe_allow_html=True)
 
-try:
-    import textrazor
-    TEXTRAZOR_AVAILABLE = True
-except ImportError:
-    TEXTRAZOR_AVAILABLE = False
+# --- SETUP ---
+google_auth_status = setup_google_auth()
+textrazor_auth_status = setup_textrazor_auth()
 
-try:
-    import cloudscraper
-    SCRAPER_AVAILABLE = True
-except ImportError:
-    SCRAPER_AVAILABLE = False
-
-try:
-    from seoanalyzer import analyze as run_seo_audit
-    SEO_LIB_AVAILABLE = True
-except ImportError:
-    SEO_LIB_AVAILABLE = False
-
-# Suppress SSL warnings
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# --- AUTHENTICATION ---
-def setup_google_auth():
-    if "google" in st.secrets and "credentials" in st.secrets["google"]:
-        try:
-            creds = st.secrets["google"]["credentials"]
-            if isinstance(creds, str):
-                try: creds = json.loads(creds)
-                except json.JSONDecodeError: return False
-            
-            creds_dict = dict(creds)
-            if "private_key" in creds_dict:
-                creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
-
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8') as f:
-                json.dump(creds_dict, f)
-                temp_cred_path = f.name
-            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_cred_path
-            return True
-        except Exception: return False
-    return False
-
-def setup_textrazor_auth():
-    if TEXTRAZOR_AVAILABLE and "textrazor" in st.secrets and "api_key" in st.secrets["textrazor"]:
-        textrazor.api_key = st.secrets["textrazor"]["api_key"]
-        return True
-    return False
-
-# --- DATABASE ---
-@st.cache_resource(show_spinner=False)
-def init_mongo_connection():
-    try:
-        uri = st.secrets["mongo"]["uri"]
-        client = pymongo.MongoClient(uri, serverSelectionTimeoutMS=5000)
-        client.admin.command('ping')
-        return client
-    except Exception: return None
-
-def get_db_collection():
-    client = init_mongo_connection()
-    if client:
-        try: return client[st.secrets["mongo"]["db"]][st.secrets["mongo"]["collection"]]
-        except KeyError: return None
-    return None
-
-# --- UTILS ---
-def get_page_hash(content):
-    return hashlib.md5(content.encode('utf-8')).hexdigest()
-
-def normalize_url(url):
-    try:
-        parsed = urlparse(url)
-        clean = parsed._replace(fragment="").geturl()
-        return clean.rstrip('/')
-    except: return url
-
-# --- IMAGE OCR ---
-def detect_text_in_image(image_url):
-    if not NLP_AVAILABLE: return None
-    try:
-        client = vision.ImageAnnotatorClient()
-        image = vision.Image()
-        image.source.image_uri = image_url
-        response = client.text_detection(image=image)
-        texts = response.text_annotations
-        if texts: return texts[0].description.strip()
-        return None
-    except Exception: return None 
-
-# --- BACKLINK FUNCTIONS ---
-def fetch_bing_backlinks(site_url, api_key):
-    if not api_key: return None, "Bing API Key missing."
-    endpoint = "https://ssl.bing.com/webmaster/api.svc/json/GetInboundLinks"
-    params = {'siteUrl': site_url, 'apikey': api_key}
-    try:
-        response = requests.get(endpoint, params=params, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            if 'd' in data: return data['d'], None
-            return data, None
-        elif response.status_code == 401: return None, "Invalid Bing API Key."
-        else: return None, f"Bing Error: {response.status_code}"
-    except Exception as e: return None, str(e)
-
-# --- NEW: PYTHON SEO ANALYZER ---
-def run_technical_audit(site_url):
-    """
-    Runs sethblack/python-seo-analyzer.
-    Returns a dict with 'pages', 'keywords', 'errors', 'warnings'.
-    """
-    if not SEO_LIB_AVAILABLE:
-        return None, "seo-analyzer library missing."
+# --- SIDEBAR ---
+with st.sidebar:
+    st.header("Control Panel")
+    c1, c2 = st.columns(2)
+    with c1:
+        if init_mongo_connection(): st.success("DB: Online")
+        else: st.error("DB: Offline")
+    with c2:
+        if google_auth_status: st.success("G-NLP: Ready")
+        else: st.warning("G-NLP: Inactive")
     
-    try:
-        # The library crawls the site automatically
-        output = run_seo_audit(site_url)
-        return output, None
-    except Exception as e:
-        return None, f"Audit Failed: {str(e)}"
+    if textrazor_auth_status: st.success("TextRazor: Ready")
+    else: st.warning("TextRazor: Inactive")
 
-# --- CRAWLER LOGIC ---
-def crawl_site(start_url):
-    collection = get_db_collection()
-    if collection is None:
-        st.error("Database unavailable.")
-        return
+    st.markdown("---")
+    target_url = st.text_input("Target URL", "https://example.com")
+    st.caption("Default Crawl Limit: 1000 Pages")
     
-    collection.delete_many({})
-    start_url = normalize_url(start_url)
-    base_domain = urlparse(start_url).netloc.replace('www.', '')
+    if st.button("Start Crawl", type="primary"):
+        crawl_site(target_url)
+        st.rerun()
+
+# --- HELPER UI ---
+def display_metric_block(title, count, df_data, color_hex, display_cols):
+    st.markdown(f"""
+    <div class="metric-card" style="background-color: {color_hex};">
+        <div class="metric-title">{title}</div>
+        <div class="metric-value">{count}</div>
+        <div class="metric-desc">Click dropdown to view details</div>
+    </div>""", unsafe_allow_html=True)
     
-    queue = [start_url]
-    visited = set()
-    count = 0
-    
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-    
-    while queue and count < 1000:
-        url = queue.pop(0)
-        if url in visited: continue
-        visited.add(url)
-        count += 1
-        progress_bar.progress(count / 1000)
-        status_text.text(f"Crawling {count}: {url}")
+    if count > 0:
+        with st.expander(f"Show Details for {title}"):
+            if isinstance(df_data, list):
+                df_display = pd.DataFrame(df_data)
+            elif isinstance(df_data, pd.DataFrame):
+                valid_cols = [c for c in display_cols if c in df_data.columns]
+                df_display = df_data[valid_cols]
+            else:
+                return
+
+            column_config = {}
+            if 'url' in df_display.columns:
+                column_config['url'] = st.column_config.LinkColumn("URL")
+            if 'Page' in df_display.columns:
+                column_config['Page'] = st.column_config.LinkColumn("Page")
+
+            st.dataframe(
+                df_display, 
+                width="stretch", 
+                column_config=column_config,
+                hide_index=True
+            )
+
+# --- MAIN UI ---
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📊 SEO Report", "🧠 NLP Analysis", "🔍 Search", "📄 Content Analysis", "🔗 Backlinks", "🛠️ Deep Tech Audit"])
+df = get_metrics_df()
+
+# TAB 1: SEO REPORT
+with tab1:
+    if df is not None:
+        st.subheader("Site Health Overview")
         
-        try:
-            time.sleep(0.1)
-            start_time = time.time()
-            response = requests.get(url, headers=headers, timeout=15, verify=False)
-            latency = (time.time() - start_time) * 1000
-            final_url = normalize_url(response.url)
-            
-            page_data = {
-                "url": final_url, "domain": base_domain, "status_code": response.status_code,
-                "content_type": response.headers.get('Content-Type', ''), "crawl_time": datetime.now(),
-                "latency_ms": latency, "links": [], "images": [], "title": "", "meta_desc": "",
-                "canonical": "", "page_text": "", "content_hash": "", "indexable": True, "h1_count": 0, "word_count": 0
-            }
+        dup_content = df[df.duplicated(subset=['content_hash'], keep=False) & (df['content_hash'] != "")]
+        display_metric_block("Duplicate Content Pages", len(dup_content), dup_content, "#FFB3BA", ['url', 'title'])
 
-            if response.status_code == 200 and 'text/html' in page_data['content_type']:
-                soup = BeautifulSoup(response.text, 'html.parser')
-                page_data['title'] = soup.title.string.strip() if soup.title and soup.title.string else ""
-                meta = soup.find('meta', attrs={'name': 'description'})
-                page_data['meta_desc'] = meta['content'].strip() if meta and meta.get('content') else ""
-                canon = soup.find('link', rel='canonical')
-                page_data['canonical'] = canon['href'] if canon else ""
-                page_data['h1_count'] = len(soup.find_all('h1'))
-                
-                for s in soup(["script", "style"]): s.extract()
-                text_content = soup.get_text(separator=' ', strip=True)
-                page_data['page_text'] = text_content
-                page_data['content_hash'] = get_page_hash(text_content)
-                page_data['word_count'] = len(text_content.split())
-                
-                imgs_found = soup.find_all('img')
-                for i, img in enumerate(imgs_found):
-                    src = img.get('src')
-                    if src:
-                        abs_src = urljoin(url, src)
-                        img_data = {'src': abs_src, 'alt': img.get('alt', ''), 'ocr_text': None}
-                        if i < 5:
-                            detected_text = detect_text_in_image(abs_src)
-                            if detected_text: img_data['ocr_text'] = detected_text
-                        page_data['images'].append(img_data)
-                
-                robots = soup.find('meta', attrs={'name': 'robots'})
-                if robots and 'noindex' in robots.get('content', '').lower(): page_data['indexable'] = False
-                
-                for link in soup.find_all('a', href=True):
-                    raw = link['href'].strip()
-                    if not raw or raw.startswith(('mailto:', 'tel:', 'javascript:', '#')): continue
-                    abs_link = normalize_url(urljoin(url, raw))
-                    if base_domain in urlparse(abs_link).netloc:
-                        page_data['links'].append(abs_link)
-                        if abs_link not in visited and abs_link not in queue: queue.append(abs_link)
+        col1, col2 = st.columns(2)
+        with col1:
+            dup_title = df[df.duplicated(subset=['title'], keep=False) & (df['title'] != "")]
+            display_metric_block("Duplicate Meta Titles", len(dup_title), dup_title, "#FFDFBA", ['url', 'title'])
+        with col2:
+            dup_desc = df[df.duplicated(subset=['meta_desc'], keep=False) & (df['meta_desc'] != "")]
+            display_metric_block("Duplicate Meta Desc", len(dup_desc), dup_desc, "#FFFFBA", ['url', 'meta_desc'])
 
-            collection.update_one({"url": final_url}, {"$set": page_data}, upsert=True)
-        except Exception as e:
-            collection.update_one({"url": url}, {"$set": {"url": url, "status_code": 0, "error": str(e)}}, upsert=True)
+        col3, col4 = st.columns(2)
+        with col3:
+            def check_canonical(row):
+                if not row['canonical']: return False
+                return row['canonical'] != row['url']
+            canon_issues = df[df.apply(check_canonical, axis=1)]
+            display_metric_block("Canonical Issues", len(canon_issues), canon_issues, "#BAFFC9", ['url', 'canonical'])
+        with col4:
+            missing_alt_data = []
+            for _, row in df.iterrows():
+                if isinstance(row['images'], list):
+                    for img in row['images']:
+                        if not img.get('alt'): missing_alt_data.append({'Page': row['url'], 'Image Src': img.get('src')})
+            display_metric_block("Missing Alt Tags", len(missing_alt_data), missing_alt_data, "#BAE1FF", ['Page', 'Image Src'])
 
-    progress_bar.progress(100)
-    status_text.success(f"Crawl Complete! Visited {count} pages.")
+        col5, col6, col7, col8 = st.columns(4)
+        with col5:
+             broken = df[df['status_code'] == 404]
+             display_metric_block("Broken Pages (404)", len(broken), broken, "#FFCCE5", ['url', 'status_code'])
+        with col6:
+            r300 = df[(df['status_code'] >= 300) & (df['status_code'] < 400)]
+            display_metric_block("3xx Redirects", len(r300), r300, "#E2B3FF", ['url', 'status_code'])
+        with col7:
+            r400 = df[(df['status_code'] >= 400) & (df['status_code'] < 500)]
+            display_metric_block("4xx Errors", len(r400), r400, "#FF9AA2", ['url', 'status_code'])
+        with col8:
+             r500 = df[df['status_code'] >= 500]
+             display_metric_block("5xx Errors", len(r500), r500, "#C7CEEA", ['url', 'status_code'])
 
-# --- METRICS CALCULATOR ---
-def get_metrics_df():
-    col = get_db_collection()
-    if col is None: return None
-    data = list(col.find({}, {'page_text': 0, '_id': 0}))
-    df = pd.DataFrame(data)
-    if df.empty: return None
+        col9, col10 = st.columns(2)
+        with col9:
+            indexable = df[df['indexable'] == True]
+            display_metric_block("Indexable Pages", len(indexable), indexable, "#B5EAD7", ['url', 'title'])
+        with col10:
+            non_indexable = df[df['indexable'] == False]
+            display_metric_block("Non-Indexable Pages", len(non_indexable), non_indexable, "#FFDAC1", ['url', 'title'])
+
+        h1_issues = df[(df['h1_count'] == 0) | (df['h1_count'] > 1)]
+        display_metric_block("On-Page Heading Issues", len(h1_issues), h1_issues, "#E2F0CB", ['url', 'h1_count'])
+
+        thin_content = df[df['word_count'] < 200]
+        display_metric_block("Thin Content (<200 words)", len(thin_content), thin_content, "#F7D9C4", ['url', 'word_count'])
+
+        slow_pages = df[df['latency_ms'] > 1500]
+        display_metric_block("Slow Pages (> 1.5s)", len(slow_pages), slow_pages, "#D7E3FC", ['url', 'latency_ms'])
+    else:
+        st.info("No crawl data available. Please start a crawl from the sidebar.")
+
+# TAB 2: GOOGLE NLP
+with tab2:
+    st.subheader("Google NLP Analysis")
+    if df is not None and google_auth_status and NLP_AVAILABLE:
+        from google.cloud import language_v1 
+        url_sel = st.selectbox("Select Page for G-NLP:", df['url'].unique(), key="gnlp_sel")
+        if st.button("Analyze with Google"):
+            doc = get_db_collection().find_one({"url": url_sel})
+            res, err = analyze_google(doc.get('page_text', ''))
+            if res:
+                s = res['sentiment']
+                c1, c2 = st.columns(2)
+                c1.metric("Sentiment", f"{s.score:.2f}")
+                c2.metric("Magnitude", f"{s.magnitude:.2f}")
+                ents = [{"Name": e.name, "Type": language_v1.Entity.Type(e.type_).name, "Salience": f"{e.salience:.1%}"} for e in res['entities'][:10]]
+                st.dataframe(pd.DataFrame(ents), width="stretch")
+            else: st.error(err)
+    elif not google_auth_status:
+        st.warning("Google NLP is not active. Check credentials.")
+
+# TAB 3: SEARCH
+with tab3:
+    q = st.text_input("Deep Search:")
+    if q and get_db_collection() is not None:
+        res = list(get_db_collection().find({"page_text": {"$regex": q, "$options": "i"}}).limit(20))
+        if res:
+            data = [{"URL": r['url'], "Match": "..." + r['page_text'][r['page_text'].lower().find(q.lower()):][:100] + "..."} for r in res]
+            st.dataframe(pd.DataFrame(data), width="stretch")
+
+# TAB 4: TEXTRAZOR
+with tab4:
+    st.subheader("Content Intelligence")
+    if df is not None:
+        tr_url_sel = st.selectbox("Select Page for Analysis:", df['url'].unique(), key="tr_sel")
+        
+        # --- SECTION: IMAGE OCR RESULTS ---
+        st.markdown("#### 🖼️ Image Text Extraction (OCR)")
+        doc = get_db_collection().find_one({"url": tr_url_sel})
+        
+        if doc and 'images' in doc and doc['images']:
+            ocr_images = [img for img in doc['images'] if img.get('ocr_text')]
+            if ocr_images:
+                st.info(f"Found {len(ocr_images)} images with readable text.")
+                ocr_df = pd.DataFrame(ocr_images)[['src', 'alt', 'ocr_text']]
+                st.dataframe(
+                    ocr_df,
+                    width="stretch",
+                    column_config={
+                        "src": st.column_config.LinkColumn("Image Link"),
+                        "alt": "Alt Text",
+                        "ocr_text": "Extracted Text (OCR)"
+                    }
+                )
+            else:
+                st.caption("No text detected in images (or OCR limit reached).")
+        else:
+            st.caption("No images found on this page.")
+        st.markdown("---")
+
+    st.markdown("#### 📝 TextRazor Text Analysis")
+    if not TEXTRAZOR_AVAILABLE: st.error("Please install TextRazor.")
+    elif not textrazor_auth_status: st.error("Please add TextRazor API key.")
+    elif df is not None:
+        if st.button("Analyze Page Text (TextRazor)"):
+            doc = get_db_collection().find_one({"url": tr_url_sel})
+            with st.spinner("Processing..."):
+                resp, err = analyze_textrazor(doc.get('page_text', ''), textrazor_auth_status)
+                if resp:
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.markdown("**Top Entities**")
+                        ents = [{"ID": e.id, "Relevance": f"{e.relevance_score:.2f}"} for e in sorted(resp.entities(), key=lambda x: x.relevance_score, reverse=True)[:10]]
+                        st.dataframe(pd.DataFrame(ents), width="stretch")
+                    with c2:
+                        st.markdown("**Top Topics**")
+                        tops = [{"Label": t.label, "Score": f"{t.score:.2f}"} for t in sorted(resp.topics(), key=lambda x: x.score, reverse=True)[:10]]
+                        st.dataframe(pd.DataFrame(tops), width="stretch")
+                else: st.error(err)
+
+# TAB 5: BACKLINKS
+with tab5:
+    st.subheader("Inbound Link Checker")
+    st.info("Check official backlinks from Bing Webmaster Tools.")
     
-    cols = ['url', 'title', 'meta_desc', 'canonical', 'images', 'status_code', 'content_hash', 'latency_ms', 'indexable', 'h1_count', 'word_count']
-    for c in cols: 
-        if c not in df.columns: df[c] = None
+    if "bing_api_key" not in st.session_state:
+        st.session_state["bing_api_key"] = ""
         
-    df['title'] = df['title'].fillna("")
-    df['meta_desc'] = df['meta_desc'].fillna("")
-    df['content_hash'] = df['content_hash'].fillna("")
-    df['canonical'] = df['canonical'].fillna("")
-    df['latency_ms'] = pd.to_numeric(df['latency_ms'], errors='coerce').fillna(0)
-    df['h1_count'] = pd.to_numeric(df['h1_count'], errors='coerce').fillna(0)
-    df['word_count'] = pd.to_numeric(df['word_count'], errors='coerce').fillna(0)
+    bing_key = st.text_input("Enter Bing API Key:", value=st.session_state["bing_api_key"], type="password")
     
-    return df
+    if st.button("Fetch Bing Backlinks"):
+        if not bing_key:
+            st.warning("Please enter a Bing API Key.")
+        else:
+            st.session_state["bing_api_key"] = bing_key
+            if not target_url:
+                st.error("Please enter a Target URL in the sidebar first.")
+            else:
+                with st.spinner(f"Fetching backlinks for {target_url}..."):
+                    data, err = fetch_bing_backlinks(target_url, bing_key)
+                    if data:
+                        st.success(f"Found {len(data)} backlinks")
+                        df_bing = pd.DataFrame(data)
+                        st.dataframe(df_bing, width="stretch", column_config={
+                            "Url": st.column_config.LinkColumn("Target Page"),
+                            "SourceUrl": st.column_config.LinkColumn("Backlink Source")
+                        })
+                    else:
+                        st.error(f"Error fetching data: {err}")
 
-# --- NLP & SCRAPER ---
-def analyze_google(text):
-    if not NLP_AVAILABLE: return None, "Library missing."
-    try:
-        client = language_v1.LanguageServiceClient()
-        if not text or len(text.split()) < 20: return None, "Text too short (<20 words)."
-        doc = language_v1.Document(content=text, type_=language_v1.Document.Type.PLAIN_TEXT)
-        sentiment = client.analyze_sentiment(request={'document': doc}).document_sentiment
-        entities = client.analyze_entities(request={'document': doc}).entities
-        return {"sentiment": sentiment, "entities": entities}, None
-    except Exception as e: return None, str(e)
-
-def analyze_textrazor(text, auth_status):
-    if not TEXTRAZOR_AVAILABLE: return None, "TextRazor Library missing."
-    if not auth_status: return None, "TextRazor API Key missing."
-    try:
-        client = textrazor.TextRazor(extractors=["entities", "topics"])
-        if not text or len(text.strip()) < 50: return None, "Text too short for TextRazor."
-        response = client.analyze(text)
-        return response, None
-    except Exception as e: return None, str(e)
-
-def scrape_external_page(url):
-    if SCRAPER_AVAILABLE:
-        try:
-            scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False})
-            resp = scraper.get(url, timeout=20)
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                for s in soup(["script", "style", "nav", "footer", "iframe", "noscript"]): s.extract()
-                return soup.get_text(separator=' ', strip=True), None
-        except Exception: pass
-
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
-        }
-        
-        session = requests.Session()
-        resp = session.get(url, headers=headers, timeout=15, verify=False)
-        
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            for s in soup(["script", "style", "nav", "footer", "iframe", "noscript"]): s.extract()
-            return soup.get_text(separator=' ', strip=True), None
-            
-        return None, f"Failed to fetch: Status {resp.status_code}"
-    except Exception as e: return None, str(e)
+# TAB 6: DEEP TECH AUDIT (NEW)
+with tab6:
+    st.subheader("Deep Technical SEO Audit")
+    st.info("Powered by python-seo-analyzer. This runs a separate, rigorous scan of your target URL.")
+    
+    if st.button("Run Deep Audit"):
+        if not target_url:
+            st.error("Please enter a Target URL in the sidebar.")
+        else:
+            with st.spinner("Running Deep Scan (this may take a minute)..."):
+                audit_data, err = run_technical_audit(target_url)
+                
+                if audit_data:
+                    # Process Results
+                    pages = audit_data.get('pages', [])
+                    
+                    all_warnings = []
+                    all_errors = []
+                    
+                    for p in pages:
+                        p_url = p.get('url', '')
+                        # Collect Warnings
+                        if 'warnings' in p and p['warnings']:
+                            for w in p['warnings']:
+                                all_warnings.append({"Page": p_url, "Warning": w})
+                        # Collect Errors
+                        if 'errors' in p and p['errors']:
+                            for e in p['errors']:
+                                all_errors.append({"Page": p_url, "Error": e})
+                    
+                    # Display Tabs for results
+                    t1, t2 = st.tabs(["⚠️ Warnings", "❌ Errors"])
+                    
+                    with t1:
+                        if all_warnings:
+                            st.dataframe(pd.DataFrame(all_warnings), width="stretch", column_config={
+                                "Page": st.column_config.LinkColumn("Page URL")
+                            })
+                        else:
+                            st.success("No Warnings Found!")
+                            
+                    with t2:
+                        if all_errors:
+                            st.dataframe(pd.DataFrame(all_errors), width="stretch", column_config={
+                                "Page": st.column_config.LinkColumn("Page URL")
+                            })
+                        else:
+                            st.success("No Critical Errors Found!")
+                            
+                else:
+                    st.error(f"Audit Failed: {err}")
