@@ -3,7 +3,9 @@ import pandas as pd
 from helpers import (
     setup_google_auth, setup_textrazor_auth, init_mongo_connection, 
     get_db_collection, crawl_site, get_metrics_df, analyze_google, 
-    analyze_textrazor, scrape_external_page, NLP_AVAILABLE, TEXTRAZOR_AVAILABLE
+    analyze_textrazor, scrape_external_page, fetch_bing_backlinks,
+    run_technical_audit, 
+    NLP_AVAILABLE, TEXTRAZOR_AVAILABLE
 )
 
 # --- CONFIG ---
@@ -48,12 +50,10 @@ with st.sidebar:
 
     st.markdown("---")
     target_url = st.text_input("Target URL", "https://example.com")
-    max_pages = st.number_input("Max Pages", 10, 500, 50)
+    st.caption("Default Crawl Limit: 1000 Pages")
+    
     if st.button("Start Crawl", type="primary"):
-        crawl_site(target_url, max_pages)
-        st.rerun()
-    if st.button("Clear DB"):
-        get_db_collection().delete_many({})
+        crawl_site(target_url)
         st.rerun()
 
 # --- HELPER UI ---
@@ -75,9 +75,7 @@ def display_metric_block(title, count, df_data, color_hex, display_cols):
             else:
                 return
 
-            # Configure Clickable Links (UPDATED)
             column_config = {}
-            # Using None for display_text defaults to showing the URL itself
             if 'url' in df_display.columns:
                 column_config['url'] = st.column_config.LinkColumn("URL")
             if 'Page' in df_display.columns:
@@ -91,7 +89,15 @@ def display_metric_block(title, count, df_data, color_hex, display_cols):
             )
 
 # --- MAIN UI ---
-tab1, tab2, tab3, tab4 = st.tabs(["📊 SEO Report", "🧠 NLP Analysis", "🔍 Search", "📄 Content Analysis"])
+# Added Tab 6: Deep Tech Audit
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "📊 SEO Report", 
+    "🧠 NLP Analysis", 
+    "🔍 Search", 
+    "📄 Content Analysis", 
+    "🔗 Backlinks", 
+    "🛠️ Deep Tech Audit"
+])
 df = get_metrics_df()
 
 # TAB 1: SEO REPORT
@@ -99,7 +105,6 @@ with tab1:
     if df is not None:
         st.subheader("Site Health Overview")
         
-        # Duplicate Content
         dup_content = df[df.duplicated(subset=['content_hash'], keep=False) & (df['content_hash'] != "")]
         display_metric_block("Duplicate Content Pages", len(dup_content), dup_content, "#FFB3BA", ['url', 'title'])
 
@@ -188,25 +193,134 @@ with tab3:
             data = [{"URL": r['url'], "Match": "..." + r['page_text'][r['page_text'].lower().find(q.lower()):][:100] + "..."} for r in res]
             st.dataframe(pd.DataFrame(data), width="stretch")
 
-# TAB 4: TEXTRAZOR
+# TAB 4: CONTENT INTELLIGENCE
 with tab4:
-    st.subheader("TextRazor Content Intelligence")
+    st.subheader("Content Intelligence")
+    if df is not None:
+        tr_url_sel = st.selectbox("Select Page for Analysis:", df['url'].unique(), key="tr_sel")
+        
+        # --- SECTION: IMAGE OCR RESULTS ---
+        st.markdown("#### 🖼️ Image Text Extraction (OCR)")
+        doc = get_db_collection().find_one({"url": tr_url_sel})
+        
+        if doc and 'images' in doc and doc['images']:
+            ocr_images = [img for img in doc['images'] if img.get('ocr_text')]
+            if ocr_images:
+                st.info(f"Found {len(ocr_images)} images with readable text.")
+                ocr_df = pd.DataFrame(ocr_images)[['src', 'alt', 'ocr_text']]
+                st.dataframe(
+                    ocr_df,
+                    width="stretch",
+                    column_config={
+                        "src": st.column_config.LinkColumn("Image Link"),
+                        "alt": "Alt Text",
+                        "ocr_text": "Extracted Text (OCR)"
+                    }
+                )
+            else:
+                st.caption("No text detected in images (or OCR limit reached).")
+        else:
+            st.caption("No images found on this page.")
+        st.markdown("---")
+
+    st.markdown("#### 📝 TextRazor Text Analysis")
     if not TEXTRAZOR_AVAILABLE: st.error("Please install TextRazor.")
     elif not textrazor_auth_status: st.error("Please add TextRazor API key.")
     elif df is not None:
-        tr_url_sel = st.selectbox("Select Page for Analysis:", df['url'].unique(), key="tr_sel")
-        if st.button("Analyze Current Page (TextRazor)"):
+        if st.button("Analyze Page Text (TextRazor)"):
             doc = get_db_collection().find_one({"url": tr_url_sel})
             with st.spinner("Processing..."):
                 resp, err = analyze_textrazor(doc.get('page_text', ''), textrazor_auth_status)
                 if resp:
                     c1, c2 = st.columns(2)
                     with c1:
-                        st.markdown("#### Top Entities")
+                        st.markdown("**Top Entities**")
                         ents = [{"ID": e.id, "Relevance": f"{e.relevance_score:.2f}"} for e in sorted(resp.entities(), key=lambda x: x.relevance_score, reverse=True)[:10]]
                         st.dataframe(pd.DataFrame(ents), width="stretch")
                     with c2:
-                        st.markdown("#### Top Topics")
+                        st.markdown("**Top Topics**")
                         tops = [{"Label": t.label, "Score": f"{t.score:.2f}"} for t in sorted(resp.topics(), key=lambda x: x.score, reverse=True)[:10]]
                         st.dataframe(pd.DataFrame(tops), width="stretch")
                 else: st.error(err)
+
+# TAB 5: BACKLINKS
+with tab5:
+    st.subheader("Inbound Link Checker")
+    st.info("Check official backlinks from Bing Webmaster Tools.")
+    
+    if "bing_api_key" not in st.session_state:
+        st.session_state["bing_api_key"] = ""
+        
+    bing_key = st.text_input("Enter Bing API Key:", value=st.session_state["bing_api_key"], type="password")
+    
+    if st.button("Fetch Bing Backlinks"):
+        if not bing_key:
+            st.warning("Please enter a Bing API Key.")
+        else:
+            st.session_state["bing_api_key"] = bing_key
+            if not target_url:
+                st.error("Please enter a Target URL in the sidebar first.")
+            else:
+                with st.spinner(f"Fetching backlinks for {target_url}..."):
+                    data, err = fetch_bing_backlinks(target_url, bing_key)
+                    if data:
+                        st.success(f"Found {len(data)} backlinks")
+                        df_bing = pd.DataFrame(data)
+                        st.dataframe(df_bing, width="stretch", column_config={
+                            "Url": st.column_config.LinkColumn("Target Page"),
+                            "SourceUrl": st.column_config.LinkColumn("Backlink Source")
+                        })
+                    else:
+                        st.error(f"Error fetching data: {err}")
+
+# TAB 6: DEEP TECH AUDIT
+with tab6:
+    st.subheader("Deep Technical SEO Audit")
+    st.info("Powered by python-seo-analyzer. This runs a separate, rigorous scan of your target URL.")
+    
+    if st.button("Run Deep Audit"):
+        if not target_url:
+            st.error("Please enter a Target URL in the sidebar.")
+        else:
+            with st.spinner("Running Deep Scan (this may take a minute)..."):
+                audit_data, err = run_technical_audit(target_url)
+                
+                if audit_data:
+                    # Process Results
+                    pages = audit_data.get('pages', [])
+                    
+                    all_warnings = []
+                    all_errors = []
+                    
+                    for p in pages:
+                        p_url = p.get('url', '')
+                        # Collect Warnings
+                        if 'warnings' in p and p['warnings']:
+                            for w in p['warnings']:
+                                all_warnings.append({"Page": p_url, "Warning": w})
+                        # Collect Errors
+                        if 'errors' in p and p['errors']:
+                            for e in p['errors']:
+                                all_errors.append({"Page": p_url, "Error": e})
+                    
+                    # Display Tabs for results
+                    t1, t2 = st.tabs(["⚠️ Warnings", "❌ Errors"])
+                    
+                    with t1:
+                        if all_warnings:
+                            st.dataframe(pd.DataFrame(all_warnings), width="stretch", column_config={
+                                "Page": st.column_config.LinkColumn("Page URL")
+                            })
+                        else:
+                            st.success("No Warnings Found!")
+                            
+                    with t2:
+                        if all_errors:
+                            st.dataframe(pd.DataFrame(all_errors), width="stretch", column_config={
+                                "Page": st.column_config.LinkColumn("Page URL")
+                            })
+                        else:
+                            st.success("No Critical Errors Found!")
+                            
+                else:
+                    st.error(f"Audit Failed: {err}")
