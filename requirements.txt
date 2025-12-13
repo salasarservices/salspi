@@ -14,4 +14,4 @@ lxml
 matplotlib
 urllib3
 textrazor
-seo-analyzer
+pyseoanalyzer
