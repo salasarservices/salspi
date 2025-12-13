@@ -3,7 +3,8 @@ import pandas as pd
 from helpers import (
     setup_google_auth, setup_textrazor_auth, init_mongo_connection, 
     get_db_collection, crawl_site, get_metrics_df, analyze_google, 
-    analyze_textrazor, scrape_external_page, NLP_AVAILABLE, TEXTRAZOR_AVAILABLE
+    analyze_textrazor, scrape_external_page, fetch_bing_backlinks, # Added import
+    NLP_AVAILABLE, TEXTRAZOR_AVAILABLE
 )
 
 # --- CONFIG ---
@@ -75,9 +76,7 @@ def display_metric_block(title, count, df_data, color_hex, display_cols):
             else:
                 return
 
-            # Configure Clickable Links (UPDATED)
             column_config = {}
-            # Using None for display_text defaults to showing the URL itself
             if 'url' in df_display.columns:
                 column_config['url'] = st.column_config.LinkColumn("URL")
             if 'Page' in df_display.columns:
@@ -91,7 +90,7 @@ def display_metric_block(title, count, df_data, color_hex, display_cols):
             )
 
 # --- MAIN UI ---
-tab1, tab2, tab3, tab4 = st.tabs(["📊 SEO Report", "🧠 NLP Analysis", "🔍 Search", "📄 Content Analysis"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 SEO Report", "🧠 NLP Analysis", "🔍 Search", "📄 Content Analysis", "🔗 Backlinks"])
 df = get_metrics_df()
 
 # TAB 1: SEO REPORT
@@ -99,7 +98,6 @@ with tab1:
     if df is not None:
         st.subheader("Site Health Overview")
         
-        # Duplicate Content
         dup_content = df[df.duplicated(subset=['content_hash'], keep=False) & (df['content_hash'] != "")]
         display_metric_block("Duplicate Content Pages", len(dup_content), dup_content, "#FFB3BA", ['url', 'title'])
 
@@ -210,3 +208,37 @@ with tab4:
                         tops = [{"Label": t.label, "Score": f"{t.score:.2f}"} for t in sorted(resp.topics(), key=lambda x: x.score, reverse=True)[:10]]
                         st.dataframe(pd.DataFrame(tops), width="stretch")
                 else: st.error(err)
+
+# TAB 5: BACKLINKS (NEW)
+with tab5:
+    st.subheader("Inbound Link Checker")
+    st.info("Check official backlinks from Bing Webmaster Tools.")
+    
+    # We use a persistent session state for the API key if entered
+    if "bing_api_key" not in st.session_state:
+        st.session_state["bing_api_key"] = ""
+        
+    bing_key = st.text_input("Enter Bing API Key:", value=st.session_state["bing_api_key"], type="password")
+    
+    if st.button("Fetch Bing Backlinks"):
+        if not bing_key:
+            st.warning("Please enter a Bing API Key.")
+        else:
+            st.session_state["bing_api_key"] = bing_key # Save for session
+            
+            # Use the Target URL from the sidebar if available, or ask for one
+            if not target_url:
+                st.error("Please enter a Target URL in the sidebar first.")
+            else:
+                with st.spinner(f"Fetching backlinks for {target_url}..."):
+                    data, err = fetch_bing_backlinks(target_url, bing_key)
+                    if data:
+                        st.success(f"Found {len(data)} backlinks")
+                        # Bing returns columns like 'Url', 'SourceUrl', 'AnchorText'
+                        df_bing = pd.DataFrame(data)
+                        st.dataframe(df_bing, width="stretch", column_config={
+                            "Url": st.column_config.LinkColumn("Target Page"),
+                            "SourceUrl": st.column_config.LinkColumn("Backlink Source")
+                        })
+                    else:
+                        st.error(f"Error fetching data: {err}")
